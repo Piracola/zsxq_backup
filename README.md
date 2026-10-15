@@ -1,40 +1,50 @@
-# 知识星球云端哨兵 (zsxq_watch)
+# zsxq-sentinel
 
-监视指定知识星球的最新话题，发现新内容立即全量备份到本机；定期复查近期话题，检测**删除 / 编辑 / 评论被删**，并通过 Telegram 等渠道即时告警。
+知识星球私有备份工具:盯住你加入的星球,新内容出现后第一时间抓回本地;已备份的内容被删除、编辑或评论被清时,立即通过 Telegram 告警。内置 Telegram 菜单机器人,手机上就能完成查看、推送、扫码续期等全部操作。
 
-## 文件
+设计目标只有一个:**内容在被删之前,已经在你手里。**
 
-| 文件 | 作用 |
+## 它做什么
+
+- **即时备份** — 按人类浏览的节奏轮询(默认 30 秒,带随机抖动),每个新话题立即保存完整数据:正文、全部评论和楼中楼回复、图片、附件、音频,原始 JSON 先落盘再渲染 Markdown。
+- **删除监测** — 定期复查近期话题,连续两轮确认消失才判定被删,删除瞬间推送告警,本地已留完整快照。
+- **篡改监测** — 话题被编辑、评论数下降,分别告警并把修订版另存。
+- **Telegram 机器人** — 见下。
+- **凭证自助续期** — 凭证失效告警后,在 Telegram 里点一下,扫码即续,全程不用碰电脑。
+
+## Telegram 菜单机器人
+
+配好机器人 token 后自动随哨兵启动,长轮询工作,不需要公网端口。发 `/menu` 进入:
+
+| 命令 | 功能 |
 | --- | --- |
-| `zsxq_watch.py` | 哨兵主程序：轮询备份 + 删除监测 + IM 告警 + Telegram 菜单机器人 |
-| `zsxq_archive.py` | 归档核心库（Client / 渲染 / 下载），被 watch 调用 |
-| `zsxq_token.py` | 从已 root 的安卓手机提取凭证（备用手段） |
-| `zsxq_login.py` | 微信扫码登录：Telegram 收码 → 扫码 → 凭证自动更新（主力手段） |
-| `watch.json.example` | 配置模板：星球 ID、轮询参数、Telegram 告警 |
-| `zsxq_sync.py` | 工作站 → VPS 的 git 推送中转脚本 |
-| `cred.json` | **不进 git**。含 access_token，用 scp 单独传 |
+| `/menu` | 主菜单 |
+| `/groups` | 列出账号加入的所有星球 |
+| `/status` | 备份条数、删除记录、各星球开关状态 |
+| `/login` | 生成微信登录二维码发给你,扫码后新凭证自动生效 |
 
-## VPS 部署（东京，一次性）
+进入某个星球后有三个开关:
+
+- **📜 最新 10 条** — 立即拉取该星球最近 10 条话题正文推送到聊天窗口
+- **🔔 自动推送** — 开启后,该星球每个新话题备份完成时,内容即刻推给你
+- **✂ 保留条数** — 在不限量 / 50 / 100 / 200 / 500 / 1000 之间循环切换,只保留最近 N 条,超出自动清理(磁盘紧张时用)
+
+所有开关状态持久化在配置文件里,重启不丢。
+
+## 部署
+
+需要:任意一台 VPS,Python 3.8+,`pip3 install pycryptodome`(扫码登录用)。
 
 ```bash
-# 1. 推代码（本机执行，host 换成你的 VPS）
-python zsxq_sync.py user@your-vps
+git clone https://github.com/Piracola/zsxq_backup /opt/zsxq && cd /opt/zsxq
+cp watch.json.example watch.json
+vi watch.json        # 填 groups(星球ID)、notify.telegram(bot token 和你的 chat_id)
+python3 -X utf8 zsxq_watch.py --once     # 试跑一轮
+```
 
-# 2. VPS 上取出工作副本
-ssh user@your-vps
-git clone /srv/git/zsxq.git /opt/zsxq && cd /opt/zsxq
+常驻(推荐 systemd):
 
-# 3. 传凭证（本机执行）
-scp cred.json user@your-vps:/opt/zsxq/
-
-# 4. 配置
-cp watch.json.example watch.json && vi watch.json   # 填 Telegram token/chat_id
-
-# 5. 试跑一轮
-python3 -X utf8 zsxq_watch.py --once
-
-# 6. 常驻
-sudo tee /etc/systemd/system/zsxq-watch.service <<'EOF'
+```ini
 [Unit]
 Description=zsxq sentinel
 After=network-online.target
@@ -47,72 +57,58 @@ RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
-EOF
-sudo systemctl enable --now zsxq-watch
-journalctl -u zsxq-watch -f     # 看日志
 ```
 
-## 代码更新（以后每次改完）
+## 配置(watch.json)
+
+| 字段 | 说明 |
+| --- | --- |
+| `groups` | 要盯的星球 ID 列表 |
+| `poll_interval` | 新话题轮询间隔秒数,实际带 ±25% 抖动 |
+| `check_interval` | 近期话题滚动复查节奏 |
+| `recent_days` | 复查最近几天的话题 |
+| `confirm_gap` | 删除判定的两轮确认最小间隔 |
+| `bot_users` | 允许操作机器人的 Telegram 用户 ID;留空则允许所有私聊 |
+| `notify.telegram` | bot token 与 chat_id,兼作机器人与告警通道 |
+| `notify.*` | 也可选企业微信 / 钉钉 / Bark / 通用 webhook |
+
+## 凭证
+
+登录凭证是跟账号绑定的 access token,支持两种获取/续期方式:
+
+1. **微信扫码(推荐)** — Telegram 里发 `/login`,或在 VPS 上跑 `python3 zsxq_login.py`,二维码发到聊天窗口,微信扫码确认后新凭证自动写入并热生效,服务无需重启。协议逆向自网页版登录流程。
+2. **手机提取(备用)** — 已 root 的安卓机可用 `zsxq_token.py` 直接提取。
+
+## 数据结构
+
+```
+backup/
+├── state.json                  # 话题状态总账(含删除标记、复查时间)
+├── index.md                    # 可读索引
+├── raw/<gid>/<tid>.json        # 原始 JSON(含全部评论)——最高优先级数据
+├── raw/<gid>/<tid>__rev_N.json # 被编辑话题的修订快照
+├── deleted/<gid>/<tid>.json    # 确认被删除的话题:删除前完整快照
+└── <星球名>_<gid>/              # Markdown + images/ + files/
+```
+
+原始 JSON 是本体,Markdown 只是视图。渲染器有 bug 也不会丢数据,`--render-only` 即可从 raw 重渲染。
+
+## 命令行
 
 ```bash
-python zsxq_sync.py user@your-vps   # 本机提交并推送
-ssh user@your-vps "cd /opt/zsxq && git pull && sudo systemctl restart zsxq-watch"
+python3 zsxq_watch.py                     # 常驻运行
+python3 zsxq_watch.py --once              # 单轮(配 cron 亦可)
+python3 zsxq_archive.py --list            # 列出账号所有星球
+python3 zsxq_archive.py --group <gid>     # 全量归档指定星球
+python3 zsxq_archive.py --render-only     # 不联网,从 raw 重渲染
+python3 verify_archive.py <备份目录>       # 校验备份完整性
+python3 zsxq_unpack.py <备份目录>          # 解包整理
 ```
 
-## 产出目录结构
+## 频率与账号安全
 
-```
-zsxq_backup/
-├── state.json              # 全部话题的状态（含删除标记、复查时间戳）
-├── index.md                # 备份索引
-├── raw/<gid>/<tid>.json    # 每个话题的原始 JSON（含全部评论，最高优先级数据）
-├── raw/<gid>/<tid>__rev_N.json  # 内容被编辑后的修订快照
-├── deleted/<gid>/<tid>.json     # 确认被删除的话题：含删除前的完整快照
-└── <星球名>_<gid>/          # 可读 Markdown + images/ + files/
-```
+所有请求都按人类节奏设计:轮询带随机抖动、单请求限速、删除判定要求两轮确认、无 WebSocket 长连接。机器人的「最新 10 条」是即点即拉,自动推送搭轮询顺风车,不产生额外请求模式。
 
-## 运行参数（watch.json）
+## License
 
-- `poll_interval: 30` — 新话题轮询间隔，实际带 ±25% 随机抖动
-- `check_interval: 600` — 滚动复查节奏，每轮检查「距上次检查最久」的一批近期话题
-- `recent_days: 3` — 只复查最近 3 天归档的话题
-- `confirm_gap: 150` — 删除判定需两轮确认的最小间隔，防瞬时误报
-- `notify_new: false` — 新话题是否也推 Telegram
-- `bot_users: []` — Telegram 机器人允许的用户 ID（数字）；空则允许所有私聊用户
-
-## Telegram 菜单机器人
-
-哨兵进程内置一个 Telegram 机器人（长轮询，无需公网端口）。配好 `notify.telegram` 后自动启用，在 Telegram 里给机器人发 `/menu` 即可：
-
-```
-/menu     主菜单
-/groups   列出账号加入的所有星球（点星球名进入）
-/status   哨兵状态
-```
-
-进入某个星球后：
-
-- **📜 最新 10 条** — 立即拉取该星球最近 10 条话题的正文推给你
-- **🔔/🔕 自动推送** — 开关该星球的「新话题自动推送」：哨兵一备份到新话题，内容立即推到 Telegram
-- **◀ 返回星球列表**
-
-开关偏好存在 watch.json（`bot_autopush` 字段），重启不丢。建议在 `bot_users` 里填上自己的 Telegram 数字 ID，只允许自己操作。
-
-## 凭证过期怎么办
-
-哨兵每轮自检凭证，失效时通过 Telegram 提醒。两种更新方式：
-
-**方式一（推荐）：扫码登录，全程手机完成**
-
-```bash
-ssh user@your-vps "cd /opt/zsxq && pip3 install pycryptodome && python3 -X utf8 zsxq_login.py"
-```
-
-二维码发到 Telegram → 微信扫码确认 → 新凭证自动写入 cred.json，哨兵自动恢复。原理：逆向了网页版登录流程（微信开放平台扫码 → code → POST /v3/access_tokens，AES-CBC+RSA 加密协议），实测端到端可用。
-
-**方式二（备用）：手机 root 提取**
-
-```bash
-python zsxq_token.py --json cred.json
-scp cred.json user@your-vps:/opt/zsxq/    # 传上去即自动恢复，无需重启
-```
+仅供个人备份自己已加入星球的内容使用。

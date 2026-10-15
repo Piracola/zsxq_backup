@@ -32,6 +32,7 @@ DEFAULT_CFG = {
     "confirm_gap": 150,        # 删除判定: 两轮确认的最小间隔 (秒), 防瞬时误报
     "notify_new": False,       # 新话题是否也发通知
     "bot_users": [],           # Telegram 机器人允许的 Telegram 用户 ID (数字); 空则允许所有私聊用户
+    "group_keep": {},          # gid -> 只保留最近 N 条 (机器人里设置); 0/缺省 = 不限制
     "notify": {
         "wecom": "",           # 企业微信机器人: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
         "dingtalk": "",        # 钉钉机器人: https://oapi.dingtalk.com/robot/send?access_token=xxx
@@ -134,6 +135,7 @@ class TgBot(threading.Thread):
         # gid -> 是否自动推送; 持久化在 watch.json
         self.autopush = dict(sent.cfg.get("bot_autopush") or {})
         self._chat_id = sent.cfg.get("bot_chat_id")  # 未配白名单时记住的私聊用户
+        self._login_running = False
 
     # ---- 持久化 ----
 
@@ -196,7 +198,8 @@ class TgBot(threading.Thread):
             _tg_call(self.token, "setMyCommands", {"commands": [
                 {"command": "menu", "description": "主菜单"},
                 {"command": "groups", "description": "我的星球"},
-                {"command": "status", "description": "哨兵状态"}]})
+                {"command": "status", "description": "哨兵状态"},
+                {"command": "login", "description": "微信扫码更新登录凭证"}]})
         except Exception:
             pass
 
@@ -205,19 +208,29 @@ class TgBot(threading.Thread):
     def kb_groups(self):
         kb = []
         for gid in sorted(self.s.gnames, key=lambda g: self.s.gnames[g]):
-            mark = " 🔄" if self.autopush.get(str(gid)) else ""
-            kb.append([{"text": self.s.gnames[gid] + mark,
+            marks = ""
+            if self.autopush.get(str(gid)):
+                marks += " 🔄"
+            if (self.s.cfg.get("group_keep") or {}).get(str(gid)):
+                marks += " ✂️"
+            kb.append([{"text": self.s.gnames[gid] + marks,
                         "callback_data": "g:" + gid}])
-        kb.append([{"text": "🔄 = 新话题自动推送中", "callback_data": "noop"}])
+        kb.append([{"text": "🔄=自动推送  ✂️=只留近期", "callback_data": "noop"}])
         return kb
+
+    KEEP_CHOICES = [0, 50, 100, 200, 500, 1000]
 
     def kb_group(self, gid):
         gname = self.s.gnames.get(gid, gid)
         on = bool(self.autopush.get(str(gid)))
+        keep = int((self.s.cfg.get("group_keep") or {}).get(str(gid)) or 0)
+        row2 = [{"text": ("✂ 只留%d条 ✓" % keep) if keep else "✂ 不限量",
+                 "callback_data": "k:" + gid}]
         return [
             [{"text": "📜 最新 10 条", "callback_data": "l:" + gid}],
             [{"text": ("🔔 自动推送: 开" if on else "🔕 自动推送: 关"),
               "callback_data": "a:" + gid}],
+            row2,
             [{"text": "◀ 返回星球列表", "callback_data": "menu"}],
         ]
 
@@ -225,11 +238,13 @@ class TgBot(threading.Thread):
 
     def menu(self, chat_id):
         kb = [[{"text": "🌍 我的星球", "callback_data": "groups"}],
-              [{"text": "📊 哨兵状态", "callback_data": "status"}]]
+              [{"text": "📊 哨兵状态", "callback_data": "status"}],
+              [{"text": "🔐 扫码更新凭证", "callback_data": "login"}]]
         self.send(chat_id,
-                  "星球哨兵机器人\n\n🌍 我的星球 — 选一个星球看内容\n"
-                  "📊 哨兵状态 — 备份运行情况\n\n"
-                  "星球名后面带 🔄 表示该星球开了新话题自动推送。", kb)
+                  "星球哨兵机器人\n\n🌍 我的星球 — 选星球看内容 / 设自动推送 / 设保留条数\n"
+                  "📊 哨兵状态 — 备份运行情况\n"
+                  "🔐 扫码更新凭证 — 凭证过期时点这里, 微信扫码即可\n\n"
+                  "星球名后面的标记: 🔄=新话题自动推送中 ✂️=只保留近期条数", kb)
 
     def status_text(self):
         s = self.s
@@ -240,6 +255,10 @@ class TgBot(threading.Thread):
                      1 for v in s.state.values() if v.get("deleted"))]
         auto = [self.s.gnames.get(g, g) for g, on in self.autopush.items() if on]
         lines.append("自动推送: %s" % (", ".join(auto) if auto else "未开启"))
+        keeps = {g: int(v) for g, v in (self.s.cfg.get("group_keep") or {}).items() if v}
+        lines.append("限量星球: %s" % (
+            ", ".join("%s→%d条" % (self.s.gnames.get(g, g), n) for g, n in keeps.items())
+            if keeps else "不限量"))
         lines.append("凭证: %s" % ("有效" if time.time() - s._last_auth_ok < 3600 else "待复核"))
         return "\n".join(lines)
 
@@ -260,6 +279,83 @@ class TgBot(threading.Thread):
         gname = self.s.gnames.get(gid, gid)
         self.send(chat_id, "「%s」自动推送已%s" % (gname, "开启 🔔" if self.autopush[key] else "关闭 🔕"),
                   self.kb_group(gid))
+
+    def cycle_keep(self, chat_id, gid):
+        """循环切换保留条数: 不限量 → 50 → 100 → 200 → 500 → 1000 → 不限量。"""
+        key = str(gid)
+        choices = self.KEEP_CHOICES
+        cur = int((self.s.cfg.get("group_keep") or {}).get(key) or 0)
+        nxt = choices[(choices.index(cur) + 1) % len(choices)] if cur in choices else choices[1]
+        gk = self.s.cfg.setdefault("group_keep", {})
+        if nxt:
+            gk[key] = nxt
+        else:
+            gk.pop(key, None)
+        # 配置改动写回 watch.json
+        try:
+            p = self.autopush_path
+            data = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+            data["group_keep"] = {k: v for k, v in gk.items() if v}
+            json.dump(data, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        except Exception as e:
+            log("[!] group_keep 写回失败: %s" % e)
+        gname = self.s.gnames.get(gid, gid)
+        if nxt:
+            removed = self.s.prune_group(gid, nxt)
+            msg = "「%s」只保留最近 %d 条, 已清理旧话题 %d 条" % (gname, nxt, removed)
+        else:
+            msg = "「%s」改为不限量 (已有内容不会找回)" % gname
+        self.send(chat_id, msg, self.kb_group(gid))
+
+    # ---- 扫码登录 ----
+
+    def start_login(self, chat_id):
+        if self._login_running:
+            self.send(chat_id, "已有一个扫码流程在进行中, 请先完成或等它超时。")
+            return
+        self._login_running = True
+        threading.Thread(target=self._login_worker, args=(chat_id,),
+                         daemon=True, name="tg-login").start()
+
+    def _login_worker(self, chat_id):
+        """跑 zsxq_login 的扫码换凭证流程, 成功后热替换哨兵凭证。"""
+        try:
+            import zsxq_login as L
+            self.send(chat_id, "🔐 正在生成微信登录二维码…")
+            uuid_, qr_url = L.wx_new_qr()
+            r = L.tg_send_photo({"telegram": self.token,
+                                 "telegram_chat_id": chat_id},
+                                qr_url, "用手机微信扫这张图, 点【确认登录】(约4分钟有效)")
+            if not r:
+                self.send(chat_id, "二维码发送失败, 请稍后再试。")
+                return
+            code = L.wait_scan(uuid_, {"telegram": self.token,
+                                       "telegram_chat_id": chat_id},
+                               qr_url, local_qr_path=None)
+            self.send(chat_id, "✅ 已确认, 正在换取新凭证…")
+            data, aduid, resp_headers = L.exchange_token(code)
+            if not data.get("succeeded"):
+                self.send(chat_id, "❌ 换取凭证失败: %s" % json.dumps(data, ensure_ascii=False)[:200])
+                return
+            token, _ = L.extract_token(data, resp_headers)
+            if not token:
+                self.send(chat_id, "❌ 响应里没找到凭证, 请看服务日志。")
+                return
+            me = ((data.get("resp_data") or {}).get("user") or {})
+            with open(self.s.cred_path, "w", encoding="utf-8") as f:
+                json.dump({"access_token": token, "aduid": aduid,
+                           "login_way": "wechat_qr_bot",
+                           "login_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                           "_user": me}, f, ensure_ascii=False, indent=1)
+            if self.s.hot_reload_cred():
+                self.send(chat_id, "✅ 登录成功: %s\n新凭证已生效, 哨兵继续盯守, 无需重启。" % me.get("name", "?"))
+            else:
+                self.send(chat_id, "⚠️ 新凭证已写入但校验未通过, 请看服务日志。")
+        except Exception as e:
+            self.send(chat_id, "❌ 登录流程出错: %s" % str(e)[:200])
+            log("[!] 机器人扫码登录异常: %r" % e)
+        finally:
+            self._login_running = False
 
     # ---- 主循环 ----
 
@@ -307,6 +403,10 @@ class TgBot(threading.Thread):
                 self.push_latest(chat, data[2:])
             elif data.startswith("a:"):
                 self.toggle_autopush(chat, data[2:])
+            elif data.startswith("k:"):
+                self.cycle_keep(chat, data[2:])
+            elif data == "login":
+                self.start_login(chat)
             elif data == "groups":
                 self.send(chat, "你加入的星球 (%d):" % len(self.s.gnames), self.kb_groups())
             elif data == "status":
@@ -330,6 +430,8 @@ class TgBot(threading.Thread):
             self.send(chat, "你加入的星球 (%d):" % len(self.s.gnames), self.kb_groups())
         elif text.startswith("/status"):
             self.send(chat, self.status_text())
+        elif text.startswith("/login"):
+            self.start_login(chat)
         elif text.startswith("/"):
             self.menu(chat)
 
@@ -337,6 +439,7 @@ class TgBot(threading.Thread):
 class Sentinel:
     def __init__(self, cred_path, out, cfg):
         self.out, self.cfg = out, cfg
+        self.cred_path = cred_path
         os.makedirs(out, exist_ok=True)
         self.state_path = os.path.join(out, "state.json")
         self.state = json.load(open(self.state_path, encoding="utf-8")) if os.path.exists(self.state_path) else {}
@@ -373,6 +476,55 @@ class Sentinel:
     def refresh_groups(self):
         for g in self.cli.groups():
             self.gnames[str(g.get("group_id"))] = g.get("name") or ""
+
+    def hot_reload_cred(self):
+        """扫码登录成功后热替换凭证, 不必重启服务。"""
+        try:
+            cred = json.load(open(self.cred_path, encoding="utf-8"))
+            tok = cred.get("access_token")
+            if not tok:
+                return False
+            self.cli = Client(tok, cred.get("aduid"),
+                              sleep=max(0.2, self.cfg.get("api_sleep", 1.0)))
+            me = self.cli.whoami()
+            if me.get("name"):
+                self._last_auth_ok = time.time()
+                self.gnames = {}
+                return True
+        except Exception as e:
+            log("[!] 凭证热替换失败: %s" % e)
+        return False
+
+    def prune_group(self, gid, keep):
+        """只保留某星球最近 keep 条备份, 超出的旧话题删除文件并移出状态。"""
+        keys = [k for k in self.state
+                if k.startswith(gid + "/") and not self.state[k].get("deleted")]
+        if len(keys) <= keep:
+            return 0
+        keys.sort(key=lambda k: self.state[k].get("time") or "")
+        gone, removed = keys[:-keep], 0
+        for k in gone:
+            tid = k.split("/", 1)[1]
+            for p in (os.path.join(self.out, "raw", gid, "%s.json" % tid),
+                      os.path.join(self.out, "deleted", gid, "%s.json" % tid)):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            v = self.state.pop(k, None)
+            md = v and v.get("file")
+            if md:
+                p = os.path.join(self.out, md)
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            removed += 1
+        self.save_state()
+        self.rebuild_index()
+        return removed
 
     # ---------- 告警 ----------
 
@@ -618,6 +770,10 @@ class Sentinel:
         if new:
             self.rebuild_index()
         self.check_topics()
+        # 机器人里给某些星球设了"只留最近 N 条"的话, 每轮收尾清理一次
+        for gid, keep in (self.cfg.get("group_keep") or {}).items():
+            if keep:
+                self.prune_group(str(gid), int(keep))
         log("[·] 本轮完成: 新增备份 %d, 状态共 %d 条" % (new, len(self.state)))
 
     def run(self):
