@@ -5,6 +5,7 @@
   "recent_days": 3,
   "confirm_gap": 150,
   "notify_new": false,
+  "bot_users": [],
   "notify": {
     "wecom": "",
     "dingtalk": "",

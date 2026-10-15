@@ -6,7 +6,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `zsxq_watch.py` | 哨兵主程序：轮询备份 + 删除监测 + IM 告警 |
+| `zsxq_watch.py` | 哨兵主程序：轮询备份 + 删除监测 + IM 告警 + Telegram 菜单机器人 |
 | `zsxq_archive.py` | 归档核心库（Client / 渲染 / 下载），被 watch 调用 |
 | `zsxq_token.py` | 从已 root 的安卓手机提取凭证（备用手段） |
 | `zsxq_login.py` | 微信扫码登录：Telegram 收码 → 扫码 → 凭证自动更新（主力手段） |
@@ -78,6 +78,25 @@ zsxq_backup/
 - `recent_days: 3` — 只复查最近 3 天归档的话题
 - `confirm_gap: 150` — 删除判定需两轮确认的最小间隔，防瞬时误报
 - `notify_new: false` — 新话题是否也推 Telegram
+- `bot_users: []` — Telegram 机器人允许的用户 ID（数字）；空则允许所有私聊用户
+
+## Telegram 菜单机器人
+
+哨兵进程内置一个 Telegram 机器人（长轮询，无需公网端口）。配好 `notify.telegram` 后自动启用，在 Telegram 里给机器人发 `/menu` 即可：
+
+```
+/menu     主菜单
+/groups   列出账号加入的所有星球（点星球名进入）
+/status   哨兵状态
+```
+
+进入某个星球后：
+
+- **📜 最新 10 条** — 立即拉取该星球最近 10 条话题的正文推给你
+- **🔔/🔕 自动推送** — 开关该星球的「新话题自动推送」：哨兵一备份到新话题，内容立即推到 Telegram
+- **◀ 返回星球列表**
+
+开关偏好存在 watch.json（`bot_autopush` 字段），重启不丢。建议在 `bot_users` 里填上自己的 Telegram 数字 ID，只允许自己操作。
 
 ## 凭证过期怎么办
 
