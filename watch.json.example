@@ -1,0 +1,16 @@
+{
+  "groups": ["12345678901234"],
+  "poll_interval": 30,
+  "check_interval": 600,
+  "recent_days": 3,
+  "confirm_gap": 150,
+  "notify_new": false,
+  "notify": {
+    "wecom": "",
+    "dingtalk": "",
+    "telegram": "在这里填 BotFather 给的 bot token",
+    "telegram_chat_id": "在这里填你的数字 chat_id",
+    "bark": "",
+    "generic": ""
+  }
+}

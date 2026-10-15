@@ -1,0 +1,22 @@
+# 凭证与私有配置绝不入库
+cred.json
+watch.json
+zsxq_backup/
+*.log
+
+# 工作站上的其他项目目录（不属于哨兵）
+work/
+ZsxqCrawler/
+zsxq_hook/
+zsxq_mod/
+zsxq_mod2/
+$W/
+null/
+__pycache__/
+*.apk
+*.zip
+PowerShell 7.6.6/
+
+# 逆向分析产物
+*.md
+!README.md
