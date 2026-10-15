@@ -15,8 +15,9 @@ tg_bot.py — 哨兵的 Telegram 菜单机器人
 星球内按钮: 最新10条 / 自动推送开关 / 保留条数 / 返回。
 偏好 (自动推送、chat_id、groups 改动) 持久化在 watch.json, 重启不丢。
 """
-import json, os, threading, time, urllib.request
-from zsxq_archive import render_text, log
+import html as _html
+import json, os, re, threading, time, urllib.parse, urllib.request
+from zsxq_archive import E_RE, render_text, log
 
 TG_API = "https://api.telegram.org/bot%s/%s"
 
@@ -29,8 +30,18 @@ def _tg_call(token, method, payload=None, timeout=35):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+_BQ_RE = re.compile(r"^", re.M)
+
+
+def _tg_quote(text):
+    """转成 Telegram HTML 的可折叠引用 (<blockquote expandable>)。
+    MarkdownV2 的转义规则太苛刻, 用 HTML parse_mode 省心: 只需转 <>&。"""
+    return "<blockquote expandable>%s</blockquote>" % _BQ_RE.sub("&gt;", _html.escape(text))
+
+
 def _fmt_topic_brief(topic, gname, with_body=True):
-    """一条话题 → 推送文本。with_body=False 时只出一行摘要 (列表用)。"""
+    """一条话题 → 推送文本 (HTML parse_mode)。
+    with_body=False 时只出一行摘要 (列表用)。"""
     tid = str(topic.get("topic_id"))
     ct = (topic.get("create_time") or "")[:16].replace("T", " ")
     author = ((topic.get("talk") or topic.get("answer")
@@ -43,22 +54,30 @@ def _fmt_topic_brief(topic, gname, with_body=True):
         tags.append("★精华")
     if topic.get("sticky"):
         tags.append("📌置顶")
-    head = "💬 %s · %s · %s%s" % (author, ct, title[:60],
+    head = "💬 %s · %s · %s%s" % (_html.escape(author), ct, _html.escape(title[:60]),
                                   (" [" + "·".join(tags) + "]") if tags else "")
     if not with_body:
         return head
-    body = render_text((topic.get("talk") or {}).get("text")
-                       or (topic.get("question") or {}).get("text")
-                       or (topic.get("answer") or {}).get("text") or "").strip()
-    ans = render_text((topic.get("answer") or {}).get("text") or "").strip()
-    L = ["%s\n星球: %s" % (head, gname)]
-    if body and not topic.get("answer"):
+    # 问答类: 提问正文用 talk/question 字段里的全文 (title 只是服务器截断的预览),
+    # 提问和回答都放进可折叠引用, 长文点开才展开
+    q = topic.get("question") or {}
+    a = topic.get("answer") or {}
+    qtext = render_text(q.get("text") or "").strip()
+    atext = render_text(a.get("text") or "").strip()
+    body = render_text((topic.get("talk") or {}).get("text") or "").strip()
+    L = ["%s\n星球: %s" % (head, _html.escape(gname))]
+    if qtext or a.get("owner"):
+        who = _html.escape((q.get("owner") or {}).get("name") or "匿名提问")
         L.append("")
-        L.append(body[:2500])
-    if ans:
+        L.append("❓ %s:" % who)
+        L.append(_tg_quote(qtext or "(提问正文为空)"))
+    if body and not q.get("text"):
         L.append("")
-        L.append("—— 回答 ——")
-        L.append(ans[:2500])
+        L.append(_tg_quote(body))
+    if atext:
+        L.append("")
+        L.append("—— %s 的回答 ——" % _html.escape((a.get("owner") or {}).get("name") or "?"))
+        L.append(_tg_quote(atext))
     L.append("")
     L.append("https://wx.zsxq.com/dweb2/index/topic/%s" % tid)
     return "\n".join(L)
@@ -123,8 +142,12 @@ class TgBot(threading.Thread):
 
     def send(self, chat_id, text, kb=None):
         try:
-            p = {"chat_id": chat_id, "text": text[:4000],
-                 "disable_web_page_preview": True}
+            text = text[:3900]
+            # 截断可能切在 <blockquote> 内部, 补上闭合标签保证 HTML 合法
+            if text.count("<blockquote") > text.count("</blockquote>"):
+                text += "</blockquote>"
+            p = {"chat_id": chat_id, "text": text,
+                 "parse_mode": "HTML", "disable_web_page_preview": True}
             if kb:
                 p["reply_markup"] = {"inline_keyboard": kb}
             _tg_call(self.token, "sendMessage", p)
