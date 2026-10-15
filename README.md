@@ -8,7 +8,8 @@
 | --- | --- |
 | `zsxq_watch.py` | 哨兵主程序：轮询备份 + 删除监测 + IM 告警 |
 | `zsxq_archive.py` | 归档核心库（Client / 渲染 / 下载），被 watch 调用 |
-| `zsxq_token.py` | 从已 root 的安卓手机提取凭证（token 过期时用） |
+| `zsxq_token.py` | 从已 root 的安卓手机提取凭证（备用手段） |
+| `zsxq_login.py` | 微信扫码登录：Telegram 收码 → 扫码 → 凭证自动更新（主力手段） |
 | `watch.json.example` | 配置模板：星球 ID、轮询参数、Telegram 告警 |
 | `zsxq_sync.py` | 工作站 → VPS 的 git 推送中转脚本 |
 | `cred.json` | **不进 git**。含 access_token，用 scp 单独传 |
@@ -80,7 +81,17 @@ zsxq_backup/
 
 ## 凭证过期怎么办
 
-哨兵每轮自检凭证，失效时通过 Telegram 提醒（6 小时冷却）。手机上重新提取：
+哨兵每轮自检凭证，失效时通过 Telegram 提醒。两种更新方式：
+
+**方式一（推荐）：扫码登录，全程手机完成**
+
+```bash
+ssh user@your-vps "cd /opt/zsxq && pip3 install pycryptodome && python3 -X utf8 zsxq_login.py"
+```
+
+二维码发到 Telegram → 微信扫码确认 → 新凭证自动写入 cred.json，哨兵自动恢复。原理：逆向了网页版登录流程（微信开放平台扫码 → code → POST /v3/access_tokens，AES-CBC+RSA 加密协议），实测端到端可用。
+
+**方式二（备用）：手机 root 提取**
 
 ```bash
 python zsxq_token.py --json cred.json
