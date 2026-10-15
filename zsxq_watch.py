@@ -145,6 +145,7 @@ class TgBot(threading.Thread):
             data = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
             data["bot_autopush"] = self.autopush
             data["bot_chat_id"] = self._chat_id
+            data["groups"] = self.s.cfg.get("groups") or []
             json.dump(data, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         except Exception as e:
             log("[!] 机器人偏好保存失败: %s" % e)
@@ -275,10 +276,19 @@ class TgBot(threading.Thread):
     def toggle_autopush(self, chat_id, gid):
         key = str(gid)
         self.autopush[key] = not self.autopush.get(key)
+        # 自动推送的前提是这个星球真的在被盯守: 不在 groups 里就加进去并落盘,
+        # 否则 poll_new 永远不会路过它, 推送开关是个摆设
+        if self.autopush[key]:
+            groups = [g for g in (self.s.cfg.get("groups") or []) if g]
+            if key not in groups:
+                groups.append(key)
+                self.s.cfg["groups"] = groups
         self.save_pref()
         gname = self.s.gnames.get(gid, gid)
-        self.send(chat_id, "「%s」自动推送已%s" % (gname, "开启 🔔" if self.autopush[key] else "关闭 🔕"),
-                  self.kb_group(gid))
+        self.send(chat_id, "「%s」自动推送已%s%s" % (
+            gname, "开启 🔔" if self.autopush[key] else "关闭 🔕",
+            "\n(该星球已加入盯守列表)" if self.autopush[key] and key in self.s.cfg["groups"] else ""),
+            self.kb_group(gid))
 
     def cycle_keep(self, chat_id, gid):
         """循环切换保留条数: 不限量 → 50 → 100 → 200 → 500 → 1000 → 不限量。"""
@@ -386,10 +396,16 @@ class TgBot(threading.Thread):
         if cb:
             msg = cb.get("message") or {}
             chat = msg.get("chat", {}).get("id")
-            if not self.allowed(msg):
-                self.send(chat, "⛔ 你不在允许名单里。请把你的 Telegram 数字 ID 加进 watch.json 的 bot_users。")
+            # 权限比对必须用 cb["from"] (按按钮的人)。
+            # msg["from"] 是发这条消息的机器人自己 —— 用它会把所有按钮点击都判成未授权。
+            actor = cb.get("from") or {}
+            probe = dict(msg)
+            probe["from"] = actor
+            if not self.allowed(probe):
+                self.send(chat, "⛔ 你不在允许名单里 (你的 ID: %s)。"
+                          "请把它加进 watch.json 的 bot_users。" % actor.get("id"))
                 return
-            self.remember_chat(msg)
+            self.remember_chat(probe)
             try:
                 _tg_call(self.token, "answerCallbackQuery", {"callback_query_id": cb["id"]})
             except Exception:
@@ -420,7 +436,8 @@ class TgBot(threading.Thread):
             return
         chat = msg.get("chat", {}).get("id")
         if not self.allowed(msg):
-            self.send(chat, "⛔ 你不在允许名单里。请把你的 Telegram 数字 ID 加进 watch.json 的 bot_users。")
+            self.send(chat, "⛔ 你不在允许名单里 (你的 ID: %s)。"
+                      "请把它加进 watch.json 的 bot_users。" % (msg.get("from") or {}).get("id"))
             return
         self.remember_chat(msg)
         text = (msg.get("text") or "").strip()
@@ -450,9 +467,6 @@ class Sentinel:
         self._auth_fail_ts = 0.0  # 凭证告警冷却
         self._last_auth_ok = 0.0  # 最近一次凭证校验通过的时间
         self.bot = None           # Telegram 机器人线程 (main 里启动)
-        self._last_poll = 0.0
-        self._last_check = 0.0
-        self._next_poll = 0.0
 
     # ---------- 基础 ----------
 
@@ -781,18 +795,21 @@ class Sentinel:
             len(self.cfg["groups"]), self.cfg["poll_interval"], self.cfg["check_interval"]))
         if not self.cfg["groups"]:
             log("[x] 没有配置星球 (--group 或 watch.json 的 groups)"); return 1
+        next_run = 0.0
         while True:
+            # 到点才干活: 实际节奏 = poll_interval ±25%, 不是死循环硬刷
             now = time.time()
+            if now < next_run:
+                time.sleep(min(next_run - now, 5))
+                continue
             base = self.cfg["poll_interval"]
             wait = base * random.uniform(0.75, 1.25)   # 抖动: 别让服务器看到钟表一样的节奏
-            self._last_poll = now
             try:
                 self.run_once()
             except Exception as e:
                 log("[!] 轮询异常: %r" % e)
                 wait = 60                              # 出异常就多歇一会再试
-            self._next_poll = now + wait
-            time.sleep(5)
+            next_run = time.time() + wait
 
 
 def main():
@@ -811,6 +828,10 @@ def main():
     if a.once:
         w.run_once()
         return 0
+    # 启动确认: 服务真的跑起来了会发这条, 收到即代表进程活着、凭证有效与否一眼可知
+    w.notify("🟢 星球哨兵已启动",
+             "盯守 %d 个星球, 轮询 %ds±25%%, 机器人菜单已就绪 (/menu)。" % (
+                 len(w.cfg["groups"]), w.cfg["poll_interval"]))
     return w.run()
 
 
