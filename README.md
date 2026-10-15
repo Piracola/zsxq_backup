@@ -59,6 +59,20 @@ RestartSec=30
 WantedBy=multi-user.target
 ```
 
+## 代码结构
+
+| 文件 | 作用 |
+| --- | --- |
+| `zsxq_watch.py` | 哨兵主程序与唯一入口:轮询备份、删除/篡改监测、IM 告警 |
+| `tg_bot.py` | Telegram 菜单机器人,随哨兵自动启动,无需单独运行 |
+| `zsxq_archive.py` | 归档核心库(Client / 渲染 / 下载),被 watch 调用 |
+| `zsxq_login.py` | 微信扫码登录,可独立运行,也被机器人 /login 调用 |
+| `zsxq_token.py` | 已 root 安卓机提取凭证(备用) |
+| `zsxq_sync.py` | 工作站 → VPS 的 git 推送中转 |
+| `verify_archive.py` / `zsxq_unpack.py` | 备份校验 / 解包整理 |
+
+依赖方向: `zsxq_watch` → `tg_bot` → `zsxq_login`;`zsxq_watch` 与 `tg_bot` → `zsxq_archive`。无反向依赖,配置与备份状态由 Sentinel 单点持有,机器人线程只读共享实例。
+
 ## 配置(watch.json)
 
 | 字段 | 说明 |
