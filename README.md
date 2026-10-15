@@ -33,12 +33,14 @@
 
 ## 部署
 
-需要:任意一台 VPS,Python 3.8+,`pip3 install pycryptodome`(扫码登录用)。
+需要:任意一台 VPS,Python 3.10+
 
 ```bash
 git clone https://github.com/Piracola/zsxq_backup /opt/zsxq && cd /opt/zsxq
+pip3 install -r requirements.txt          # python-telegram-bot + pycryptodome
 cp watch.json.example watch.json
 vi watch.json        # 填 groups(星球ID)、notify.telegram(bot token 和你的 chat_id)
+python3 -X utf8 test_tg_bot.py           # 自检: 不联网, 验证机器人逻辑
 python3 -X utf8 zsxq_watch.py --once     # 试跑一轮
 ```
 
@@ -64,12 +66,16 @@ WantedBy=multi-user.target
 | 文件 | 作用 |
 | --- | --- |
 | `zsxq_watch.py` | 哨兵主程序与唯一入口:轮询备份、删除/篡改监测、IM 告警 |
-| `tg_bot.py` | Telegram 菜单机器人,随哨兵自动启动,无需单独运行 |
+| `tg_bot.py` | Telegram 菜单机器人(python-telegram-bot 22.x),随哨兵启动,无需单独运行 |
 | `zsxq_archive.py` | 归档核心库(Client / 渲染 / 下载),被 watch 调用 |
 | `zsxq_login.py` | 微信扫码登录,可独立运行,也被机器人 /login 调用 |
 | `zsxq_token.py` | 已 root 安卓机提取凭证(备用) |
 | `zsxq_sync.py` | 工作站 → VPS 的 git 推送中转 |
+| `test_tg_bot.py` | 机器人离线自检(不联网),改完机器人跑一下 |
 | `verify_archive.py` / `zsxq_unpack.py` | 备份校验 / 解包整理 |
+| `requirements.txt` | 依赖清单 |
+
+机器人跑在哨兵进程内的独立线程里,自带 asyncio 事件循环:哨兵是同步世界,通过跨线程投递把新话题推给机器人;所有拉取/清理类阻塞操作都丢到线程池,所以你在手机上点按钮时菜单不会被卡住。
 
 依赖方向: `zsxq_watch` → `tg_bot` → `zsxq_login`;`zsxq_watch` 与 `tg_bot` → `zsxq_archive`。无反向依赖,配置与备份状态由 Sentinel 单点持有,机器人线程只读共享实例。
 
@@ -112,6 +118,7 @@ backup/
 ```bash
 python3 zsxq_watch.py                     # 常驻运行
 python3 zsxq_watch.py --once              # 单轮(配 cron 亦可)
+python3 test_tg_bot.py                    # 机器人离线自检(不联网)
 python3 zsxq_archive.py --list            # 列出账号所有星球
 python3 zsxq_archive.py --group <gid>     # 全量归档指定星球
 python3 zsxq_archive.py --render-only     # 不联网,从 raw 重渲染

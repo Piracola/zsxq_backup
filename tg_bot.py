@@ -1,53 +1,99 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tg_bot.py — 哨兵的 Telegram 菜单机器人
+tg_bot.py — 哨兵的 Telegram 机器人 (python-telegram-bot 22.x)
 
-长轮询线程, 随哨兵进程启动 (zsxq_watch.py 里 TgBot(sent).start())。
-通过传入的 Sentinel 实例读星球列表、复用备份与热替换凭证能力;
-本模块自身不碰 zsxq API。
+线程模型
+  机器人跑在哨兵进程内的独立线程里, 自带一个 asyncio 事件循环 (run_polling)。
+  哨兵是同步世界, 通过 push_text() 把内容投递进那个循环, 互不阻塞。
+  所有 zsxq 侧的阻塞调用 (拉话题、扫码轮询、清理文件) 一律用 asyncio.to_thread
+  丢出事件循环 —— 所以菜单在拉取期间依然响应。
 
-命令:
-  /start /menu   主菜单
-  /groups        列出账号加入的所有星球 (点星球名进入)
-  /status        哨兵状态
-  /login         微信扫码更新登录凭证
-星球内按钮: 最新10条 / 自动推送开关 / 保留条数 / 返回。
+命令
+  /start /menu   主菜单      /groups  我的星球
+  /status        哨兵状态    /login   微信扫码更新凭证
+星球内按钮: 最新10条 / 自动推送开关 / 保留条数 / 返回
 偏好 (自动推送、chat_id、groups 改动) 持久化在 watch.json, 重启不丢。
 """
+import asyncio
 import html as _html
-import json, os, re, threading, time, urllib.parse, urllib.request
-from zsxq_archive import E_RE, render_text, log
+import json
+import os
+import re
+import threading
+import time
+import urllib.parse
 
-TG_API = "https://api.telegram.org/bot%s/%s"
+import telegram
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+                      LinkPreviewOptions)
+from telegram.constants import ParseMode
+from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler,
+                          CommandHandler, MessageHandler, filters)
+
+from zsxq_archive import E_RE, log
+
+MAXLEN = 3900                     # Telegram 单条上限 4096, 留出标签余量
+BQ_OPEN, BQ_CLOSE = "<blockquote expandable>", "</blockquote>"
+NOPREVIEW = LinkPreviewOptions(is_disabled=True)
+MENU_TEXT = ("星球哨兵机器人\n\n🌍 我的星球 — 选星球看内容 / 设自动推送 / 设保留条数\n"
+             "📊 哨兵状态 — 备份运行情况\n"
+             "🔐 扫码更新凭证 — 凭证过期时点这里, 微信扫码即可\n\n"
+             "星球名后面的标记: 🔄=新话题自动推送中 ✂️=只保留近期条数")
 
 
-def _tg_call(token, method, payload=None, timeout=35):
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(TG_API % (token, method), data=data)
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
+# ---------- 文本渲染 (HTML parse_mode) ----------
+
+def _inline_html(s):
+    """星球的内联标记 <e .../> → Telegram HTML; 其余文本转义。
+    web 链接变 <a>, 加粗变 <b>, 其它取 title。"""
+    out, pos, s = [], 0, s or ""
+    for m in E_RE.finditer(s):
+        out.append(_html.escape(s[pos:m.start()]))
+        a = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+        t = a.get("type")
+        title = _html.escape(urllib.parse.unquote(a.get("title", "")))
+        if t == "web":
+            href = _html.escape(urllib.parse.unquote(a.get("href", "")), quote=True)
+            label = title or href
+            if a.get("style") == "book":
+                label = "📖 " + label
+            out.append('<a href="%s">%s</a>' % (href, label) if href else label)
+        elif t == "text_bold":
+            out.append("<b>%s</b>" % title)
+        else:
+            out.append(title)
+        pos = m.end()
+    out.append(_html.escape(s[pos:]))
+    return "".join(out)
 
 
-_BQ_RE = re.compile(r"^", re.M)
+def _plain(s):
+    """去掉标记, 用于标题这类纯文本位置。"""
+    return _html.unescape(re.sub(r"<[^>]+>", "", _inline_html(s)))
 
 
-def _tg_quote(text):
-    """转成 Telegram HTML 的可折叠引用 (<blockquote expandable>)。
-    MarkdownV2 的转义规则太苛刻, 用 HTML parse_mode 省心: 只需转 <>&。"""
-    return "<blockquote expandable>%s</blockquote>" % _BQ_RE.sub("&gt;", _html.escape(text))
+def _quote(s_html):
+    """可折叠引用。入参必须已经是转义好的 HTML。"""
+    return BQ_OPEN + s_html + BQ_CLOSE
+
+
+def _clamp(text):
+    """截到单条上限; 若切在引用内部, 补上闭合标签保证 HTML 合法。"""
+    text = text[:MAXLEN]
+    if text.count("<blockquote") > text.count(BQ_CLOSE):
+        text += BQ_CLOSE
+    return text
 
 
 def _fmt_topic_brief(topic, gname, with_body=True):
-    """一条话题 → 推送文本 (HTML parse_mode)。
-    with_body=False 时只出一行摘要 (列表用)。"""
+    """一条话题 → 推送文本 (HTML)。with_body=False 只出一行摘要。"""
     tid = str(topic.get("topic_id"))
     ct = (topic.get("create_time") or "")[:16].replace("T", " ")
     author = ((topic.get("talk") or topic.get("answer")
                or topic.get("question") or {}).get("owner") or {}).get("name") or "?"
-    title = (render_text(topic.get("title") or "").strip()
-             or render_text((topic.get("talk") or {}).get("text") or "").strip()
+    title = (_plain(topic.get("title") or "").strip()
+             or _plain((topic.get("talk") or {}).get("text") or "").strip()
              or "(无标题)")
     tags = []
     if topic.get("digested"):
@@ -58,47 +104,157 @@ def _fmt_topic_brief(topic, gname, with_body=True):
                                   (" [" + "·".join(tags) + "]") if tags else "")
     if not with_body:
         return head
-    # 问答类: 提问正文用 talk/question 字段里的全文 (title 只是服务器截断的预览),
-    # 提问和回答都放进可折叠引用, 长文点开才展开
+    # 问答类: title 只是服务器截断的预览, 提问正文在 question.text 里
     q = topic.get("question") or {}
     a = topic.get("answer") or {}
-    qtext = render_text(q.get("text") or "").strip()
-    atext = render_text(a.get("text") or "").strip()
-    body = render_text((topic.get("talk") or {}).get("text") or "").strip()
+    qraw = (q.get("text") or "").strip()
+    araw = (a.get("text") or "").strip()
+    braw = ((topic.get("talk") or {}).get("text") or "").strip()
     L = ["%s\n星球: %s" % (head, _html.escape(gname))]
-    if qtext or a.get("owner"):
+    if qraw or q.get("owner"):
         who = _html.escape((q.get("owner") or {}).get("name") or "匿名提问")
-        L.append("")
-        L.append("❓ %s:" % who)
-        L.append(_tg_quote(qtext or "(提问正文为空)"))
-    if body and not q.get("text"):
-        L.append("")
-        L.append(_tg_quote(body))
-    if atext:
-        L.append("")
-        L.append("—— %s 的回答 ——" % _html.escape((a.get("owner") or {}).get("name") or "?"))
-        L.append(_tg_quote(atext))
-    L.append("")
-    L.append("https://wx.zsxq.com/dweb2/index/topic/%s" % tid)
+        L += ["", "❓ %s:" % who, _quote(_inline_html(qraw) or "(提问正文为空)")]
+    if braw and not qraw:
+        L += ["", _quote(_inline_html(braw))]
+    if araw:
+        L += ["", "—— %s 的回答 ——" % _html.escape((a.get("owner") or {}).get("name") or "?"),
+              _quote(_inline_html(araw))]
+    L += ["", "https://wx.zsxq.com/dweb2/index/topic/%s" % tid]
     return "\n".join(L)
 
 
 class TgBot(threading.Thread):
-    """Telegram 长轮询机器人。跑在哨兵进程内的独立线程里,
-    通过共享的 Sentinel 实例读星球列表/复用它的备份与推送能力。"""
+    """Telegram 机器人线程。共享 Sentinel 实例读星球列表/备份状态,
+    并把阻塞操作丢到线程池, 保持菜单响应。"""
+
+    KEEP_CHOICES = [0, 50, 100, 200, 500, 1000]
 
     def __init__(self, sent):
         super().__init__(daemon=True, name="tg-bot")
         self.s = sent
         n = sent.cfg.get("notify") or {}
         self.token = n.get("telegram") or ""
-        self.admins = set(str(x) for x in sent.cfg.get("bot_users") or [])
+        self.admins = {str(x) for x in (sent.cfg.get("bot_users") or [])}
         self.autopush_path = sent.cfg.get("_config_path") or "watch.json"
-        self.offset = 0
-        # gid -> 是否自动推送; 持久化在 watch.json
         self.autopush = dict(sent.cfg.get("bot_autopush") or {})
-        self._chat_id = sent.cfg.get("bot_chat_id")  # 未配白名单时记住的私聊用户
+        self._chat_id = sent.cfg.get("bot_chat_id")
         self._login_running = False
+        self._loop = None
+        self.app = None
+        if not self.token:
+            return
+        self.app = (Application.builder().token(self.token)
+                    .post_init(self._post_init).build())
+        a = self.app
+        # 鉴权放在 -1 组: 不通过就 ApplicationHandlerStop, 后面的组一律不执行
+        a.add_handler(MessageHandler(filters.ALL, self.guard), group=-1)
+        a.add_handler(CallbackQueryHandler(self.guard), group=-1)
+        a.add_handler(CommandHandler(["start", "menu"], self.cmd_menu))
+        a.add_handler(CommandHandler("groups", self.cmd_groups))
+        a.add_handler(CommandHandler("status", self.cmd_status))
+        a.add_handler(CommandHandler("login", self.cmd_login))
+        a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.cmd_menu))
+        for pat, fn in (("^g:", self.cb_group), ("^l:", self.cb_latest),
+                        ("^a:", self.cb_autopush), ("^k:", self.cb_keep),
+                        ("^menu$", self.cb_menu), ("^groups$", self.cb_groups),
+                        ("^status$", self.cb_status), ("^login$", self.cb_login),
+                        ("^noop$", self.cb_noop)):
+            a.add_handler(CallbackQueryHandler(fn, pattern=pat))
+
+    # ---- 生命周期 ----
+
+    async def _post_init(self, app):
+        self._loop = asyncio.get_running_loop()      # 供哨兵线程跨线程投递
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("menu", "主菜单"), BotCommand("groups", "我的星球"),
+                BotCommand("status", "哨兵状态"), BotCommand("login", "微信扫码更新凭证")])
+        except Exception as e:
+            log("[!] setMyCommands 失败: %s" % str(e)[:100])
+        log("[+] Telegram 机器人已启动 (python-telegram-bot %s)" % telegram.__version__)
+
+    def run(self):
+        if not self.app:
+            log("[!] 未配置 Telegram bot token, 机器人菜单不可用")
+            return
+        while True:                    # 兜底: 任何原因退出都重启, 别让菜单悄悄死掉
+            try:
+                self.app.run_polling(stop_signals=None,       # 不在主线程, 不能碰信号
+                                     bootstrap_retries=-1,    # 启动期连不上就一直重试
+                                     allowed_updates=["message", "callback_query"],
+                                     timeout=30)
+                return
+            except Exception as e:
+                log("[!] 机器人线程异常, 10s 后重启: %r" % e)
+                time.sleep(10)
+
+    def push_text(self, text):
+        """哨兵 (同步线程) 调用: 把一条 HTML 文本投递进事件循环。"""
+        chat = self.push_chat_id()
+        if not (chat and self._loop and self.app):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._send(chat, text), self._loop)
+        except Exception as e:
+            log("[!] 推送投递失败: %s" % str(e)[:120])
+
+    # ---- 发送 ----
+
+    async def _send(self, chat_id, text, kb=None):
+        try:
+            await self.app.bot.send_message(chat_id, _clamp(text), parse_mode=ParseMode.HTML,
+                                            link_preview_options=NOPREVIEW, reply_markup=kb)
+        except Exception as e:
+            log("[!] Telegram 发送失败: %s" % str(e)[:150])
+
+    async def _show(self, query, text, kb=None):
+        """按钮导航: 尽量就地改这条消息, 改不动就新发一条。"""
+        try:
+            await query.edit_message_text(_clamp(text), parse_mode=ParseMode.HTML,
+                                          link_preview_options=NOPREVIEW, reply_markup=kb)
+        except telegram.error.BadRequest as e:
+            if "not modified" not in str(e).lower():
+                await self._send(query.message.chat_id, text, kb)
+        except Exception:
+            await self._send(query.message.chat_id, text, kb)
+
+    # ---- 鉴权 ----
+
+    def _allowed(self, update):
+        uid = update.effective_user.id if update.effective_user else None
+        if self.admins:
+            return str(uid) in self.admins
+        chat = update.effective_chat
+        return bool(chat and chat.type == "private")
+
+    async def guard(self, update, context):
+        if not self._allowed(update):
+            uid = update.effective_user.id if update.effective_user else "?"
+            if update.effective_chat:
+                await self._send(update.effective_chat.id,
+                                 "⛔ 你不在允许名单里 (你的 ID: %s)。"
+                                 "请把它加进 watch.json 的 bot_users。" % uid)
+            raise ApplicationHandlerStop
+        self.remember_chat(update)
+        return None
+
+    def admins_or_any_chat(self):
+        """自动推送的去处: 有白名单推第一个管理员, 否则推记住的私聊用户。"""
+        return bool(self.admins or self._chat_id)
+
+    def push_chat_id(self):
+        if self.admins:
+            return sorted(self.admins)[0]
+        return self._chat_id
+
+    def remember_chat(self, update):
+        """没配白名单时, 记住第一个私聊用户作为自动推送对象 (存 watch.json)。"""
+        if self.admins or self._chat_id:
+            return
+        chat = update.effective_chat
+        if chat and chat.type == "private":
+            self._chat_id = chat.id
+            self.save_pref()
 
     # ---- 持久化 ----
 
@@ -113,138 +269,137 @@ class TgBot(threading.Thread):
         except Exception as e:
             log("[!] 机器人偏好保存失败: %s" % e)
 
-    # ---- 权限 ----
-
-    def allowed(self, msg):
-        uid = str(((msg.get("from") or {}).get("id")) or "")
-        if self.admins:
-            return uid in self.admins
-        return msg.get("chat", {}).get("type") == "private"
-
-    def admins_or_any_chat(self):
-        """自动推送的去处: 有白名单推第一个管理员, 否则推记住的私聊用户。"""
-        return bool(self.admins or self._chat_id)
-
-    def push_chat_id(self):
-        if self.admins:
-            return sorted(self.admins)[0]
-        return self._chat_id
-
-    def remember_chat(self, msg):
-        """没配 bot_users 时, 记住第一个私聊用户作为自动推送对象 (存 watch.json)。"""
-        if self.admins or self._chat_id:
-            return
-        if msg.get("chat", {}).get("type") == "private":
-            self._chat_id = msg["chat"]["id"]
-            self.save_pref()
-
-    # ---- 发送 ----
-
-    def send(self, chat_id, text, kb=None):
-        try:
-            text = text[:3900]
-            # 截断可能切在 <blockquote> 内部, 补上闭合标签保证 HTML 合法
-            if text.count("<blockquote") > text.count("</blockquote>"):
-                text += "</blockquote>"
-            p = {"chat_id": chat_id, "text": text,
-                 "parse_mode": "HTML", "disable_web_page_preview": True}
-            if kb:
-                p["reply_markup"] = {"inline_keyboard": kb}
-            _tg_call(self.token, "sendMessage", p)
-        except Exception as e:
-            log("[!] Telegram 发送失败: %s" % str(e)[:120])
-
-    def send_long(self, chat_id, texts, kb=None):
-        """分段发送一串文本 (Telegram 单条上限 4096)。"""
-        for i, t in enumerate(texts):
-            self.send(chat_id, t, kb if i == len(texts) - 1 else None)
-            if i < len(texts) - 1:
-                time.sleep(0.6)
-
-    def set_menu(self):
-        try:
-            _tg_call(self.token, "setMyCommands", {"commands": [
-                {"command": "menu", "description": "主菜单"},
-                {"command": "groups", "description": "我的星球"},
-                {"command": "status", "description": "哨兵状态"},
-                {"command": "login", "description": "微信扫码更新登录凭证"}]})
-        except Exception:
-            pass
-
     # ---- 键盘 ----
 
+    def kb_menu(self):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌍 我的星球", callback_data="groups")],
+            [InlineKeyboardButton("📊 哨兵状态", callback_data="status")],
+            [InlineKeyboardButton("🔐 扫码更新凭证", callback_data="login")]])
+
     def kb_groups(self):
-        kb = []
+        rows = []
         for gid in sorted(self.s.gnames, key=lambda g: self.s.gnames[g]):
             marks = ""
             if self.autopush.get(str(gid)):
                 marks += " 🔄"
             if (self.s.cfg.get("group_keep") or {}).get(str(gid)):
                 marks += " ✂️"
-            kb.append([{"text": self.s.gnames[gid] + marks,
-                        "callback_data": "g:" + gid}])
-        kb.append([{"text": "🔄=自动推送  ✂️=只留近期", "callback_data": "noop"}])
-        return kb
-
-    KEEP_CHOICES = [0, 50, 100, 200, 500, 1000]
+            rows.append([InlineKeyboardButton(self.s.gnames[gid] + marks,
+                                              callback_data="g:" + gid)])
+        rows.append([InlineKeyboardButton("🔄=自动推送  ✂️=只留近期", callback_data="noop")])
+        return InlineKeyboardMarkup(rows)
 
     def kb_group(self, gid):
-        gname = self.s.gnames.get(gid, gid)
         on = bool(self.autopush.get(str(gid)))
         keep = int((self.s.cfg.get("group_keep") or {}).get(str(gid)) or 0)
-        row2 = [{"text": ("✂ 只留%d条 ✓" % keep) if keep else "✂ 不限量",
-                 "callback_data": "k:" + gid}]
-        return [
-            [{"text": "📜 最新 10 条", "callback_data": "l:" + gid}],
-            [{"text": ("🔔 自动推送: 开" if on else "🔕 自动推送: 关"),
-              "callback_data": "a:" + gid}],
-            row2,
-            [{"text": "◀ 返回星球列表", "callback_data": "menu"}],
-        ]
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📜 最新 10 条", callback_data="l:" + gid)],
+            [InlineKeyboardButton("🔔 自动推送: 开" if on else "🔕 自动推送: 关",
+                                  callback_data="a:" + gid)],
+            [InlineKeyboardButton(("✂ 只留%d条 ✓" % keep) if keep else "✂ 不限量",
+                                  callback_data="k:" + gid)],
+            [InlineKeyboardButton("◀ 返回星球列表", callback_data="menu")]])
+
+    # ---- 命令 ----
+
+    async def cmd_menu(self, update, context):
+        await self._send(update.effective_chat.id, MENU_TEXT, self.kb_menu())
+
+    async def cmd_groups(self, update, context):
+        await self._send(update.effective_chat.id,
+                         "你加入的星球 (%d):" % len(self.s.gnames), self.kb_groups())
+
+    async def cmd_status(self, update, context):
+        await self._send(update.effective_chat.id,
+                         await asyncio.to_thread(self.status_text))
+
+    async def cmd_login(self, update, context):
+        context.application.create_task(self.do_login(update.effective_chat.id))
+
+    # ---- 按钮 ----
+
+    async def cb_noop(self, update, context):
+        await update.callback_query.answer()
+
+    async def cb_menu(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        await self._show(q, MENU_TEXT, self.kb_menu())
+
+    async def cb_groups(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        await self._show(q, "你加入的星球 (%d):" % len(self.s.gnames), self.kb_groups())
+
+    async def cb_status(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        await self._show(q, await asyncio.to_thread(self.status_text))
+
+    async def cb_login(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        context.application.create_task(self.do_login(q.message.chat_id))
+
+    async def cb_group(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        gid = q.data.split(":", 1)[1]
+        await self._show(q, "「%s」(%s)" % (self.s.gnames.get(gid, gid), gid),
+                         self.kb_group(gid))
+
+    async def cb_latest(self, update, context):
+        q = update.callback_query
+        await q.answer("正在拉取…")
+        await self.push_latest(q.message.chat_id, q.data.split(":", 1)[1])
+
+    async def cb_autopush(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        gid = q.data.split(":", 1)[1]
+        await self._show(q, self.toggle_autopush(gid), self.kb_group(gid))
+
+    async def cb_keep(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        gid = q.data.split(":", 1)[1]
+        msg = await asyncio.to_thread(self.cycle_keep, gid)      # 清理文件, 别卡住循环
+        await self._show(q, msg, self.kb_group(gid))
 
     # ---- 动作 ----
 
-    def menu(self, chat_id):
-        kb = [[{"text": "🌍 我的星球", "callback_data": "groups"}],
-              [{"text": "📊 哨兵状态", "callback_data": "status"}],
-              [{"text": "🔐 扫码更新凭证", "callback_data": "login"}]]
-        self.send(chat_id,
-                  "星球哨兵机器人\n\n🌍 我的星球 — 选星球看内容 / 设自动推送 / 设保留条数\n"
-                  "📊 哨兵状态 — 备份运行情况\n"
-                  "🔐 扫码更新凭证 — 凭证过期时点这里, 微信扫码即可\n\n"
-                  "星球名后面的标记: 🔄=新话题自动推送中 ✂️=只保留近期条数", kb)
-
     def status_text(self):
         s = self.s
+        state = list(s.state.values())          # 快照: 哨兵线程同时在改这个 dict
         lines = ["📊 哨兵状态",
                  "盯守星球: %d 个" % len(s.cfg["groups"]),
-                 "备份话题: %d 条" % len(s.state),
-                 "删除记录: %d 条" % sum(
-                     1 for v in s.state.values() if v.get("deleted"))]
-        auto = [self.s.gnames.get(g, g) for g, on in self.autopush.items() if on]
+                 "备份话题: %d 条" % len(state),
+                 "删除记录: %d 条" % sum(1 for v in state if v.get("deleted"))]
+        auto = [s.gnames.get(g, g) for g, on in self.autopush.items() if on]
         lines.append("自动推送: %s" % (", ".join(auto) if auto else "未开启"))
-        keeps = {g: int(v) for g, v in (self.s.cfg.get("group_keep") or {}).items() if v}
+        keeps = {g: int(v) for g, v in (s.cfg.get("group_keep") or {}).items() if v}
         lines.append("限量星球: %s" % (
-            ", ".join("%s→%d条" % (self.s.gnames.get(g, g), n) for g, n in keeps.items())
+            ", ".join("%s→%d条" % (s.gnames.get(g, g), n) for g, n in keeps.items())
             if keeps else "不限量"))
         lines.append("凭证: %s" % ("有效" if time.time() - s._last_auth_ok < 3600 else "待复核"))
         return "\n".join(lines)
 
-    def push_latest(self, chat_id, gid, n=10):
+    async def push_latest(self, chat_id, gid, n=10):
         gname = self.s.gnames.get(gid, gid)
-        self.send(chat_id, "正在拉取「%s」最新 %d 条…" % (gname, n))
-        topics = self.s.latest_page(gid, count=n)[:n]
+        await self._send(chat_id, "正在拉取「%s」最新 %d 条…" % (gname, n))
+        topics = (await asyncio.to_thread(self.s.latest_page, gid, n) or [])[:n]
         if not topics:
-            self.send(chat_id, "没有拉到话题 (可能星球没内容或请求失败)。")
+            await self._send(chat_id, "没有拉到话题 (可能星球没内容或请求失败)。")
             return
-        msgs = [_fmt_topic_brief(t, gname) for t in topics]
-        self.send_long(chat_id, msgs)
+        for t in topics:
+            await self._send(chat_id, _fmt_topic_brief(t, gname))
+            await asyncio.sleep(0.6)
 
-    def toggle_autopush(self, chat_id, gid):
+    def toggle_autopush(self, gid):
+        """开关自动推送。开启时把星球补进盯守列表 —— 不在 groups 里永远不会被轮询到。"""
         key = str(gid)
         self.autopush[key] = not self.autopush.get(key)
-        # 自动推送的前提是这个星球真的在被盯守: 不在 groups 里就加进去并落盘,
-        # 否则 poll_new 永远不会路过它, 推送开关是个摆设
         if self.autopush[key]:
             groups = [g for g in (self.s.cfg.get("groups") or []) if g]
             if key not in groups:
@@ -252,169 +407,89 @@ class TgBot(threading.Thread):
                 self.s.cfg["groups"] = groups
         self.save_pref()
         gname = self.s.gnames.get(gid, gid)
-        self.send(chat_id, "「%s」自动推送已%s%s" % (
+        return "「%s」自动推送已%s%s" % (
             gname, "开启 🔔" if self.autopush[key] else "关闭 🔕",
-            "\n(该星球已加入盯守列表)" if self.autopush[key] and key in self.s.cfg["groups"] else ""),
-            self.kb_group(gid))
+            "\n(该星球已加入盯守列表)" if self.autopush[key] else "")
 
-    def cycle_keep(self, chat_id, gid):
+    def cycle_keep(self, gid):
         """循环切换保留条数: 不限量 → 50 → 100 → 200 → 500 → 1000 → 不限量。"""
-        key = str(gid)
-        choices = self.KEEP_CHOICES
+        key, choices = str(gid), self.KEEP_CHOICES
         cur = int((self.s.cfg.get("group_keep") or {}).get(key) or 0)
         nxt = choices[(choices.index(cur) + 1) % len(choices)] if cur in choices else choices[1]
         gk = self.s.cfg.setdefault("group_keep", {})
-        if nxt:
-            gk[key] = nxt
-        else:
+        gk[key] = nxt
+        if not nxt:
             gk.pop(key, None)
-        # 配置改动写回 watch.json
-        try:
-            p = self.autopush_path
-            data = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
-            data["group_keep"] = {k: v for k, v in gk.items() if v}
-            json.dump(data, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-        except Exception as e:
-            log("[!] group_keep 写回失败: %s" % e)
+        self.save_pref()
         gname = self.s.gnames.get(gid, gid)
         if nxt:
-            removed = self.s.prune_group(gid, nxt)
-            msg = "「%s」只保留最近 %d 条, 已清理旧话题 %d 条" % (gname, nxt, removed)
-        else:
-            msg = "「%s」改为不限量 (已有内容不会找回)" % gname
-        self.send(chat_id, msg, self.kb_group(gid))
+            return "「%s」只保留最近 %d 条, 已清理旧话题 %d 条" % (
+                gname, nxt, self.s.prune_group(gid, nxt))
+        return "「%s」改为不限量 (已有内容不会找回)" % gname
 
     # ---- 扫码登录 ----
 
-    def start_login(self, chat_id):
+    async def do_login(self, chat_id):
+        """整条扫码链路跑在机器人线程里, 阻塞步骤全部 to_thread。"""
         if self._login_running:
-            self.send(chat_id, "已有一个扫码流程在进行中, 请先完成或等它超时。")
+            await self._send(chat_id, "已有一个扫码流程在进行中, 请先完成或等它超时。")
             return
         self._login_running = True
-        threading.Thread(target=self._login_worker, args=(chat_id,),
-                         daemon=True, name="tg-login").start()
-
-    def _login_worker(self, chat_id):
-        """跑 zsxq_login 的扫码换凭证流程, 成功后热替换哨兵凭证。"""
         try:
             import zsxq_login as L
-            self.send(chat_id, "🔐 正在生成微信登录二维码…")
-            uuid_, qr_url = L.wx_new_qr()
-            r = L.tg_send_photo({"telegram": self.token,
-                                 "telegram_chat_id": chat_id},
-                                qr_url, "用手机微信扫这张图, 点【确认登录】(约4分钟有效)")
-            if not r:
-                self.send(chat_id, "二维码发送失败, 请稍后再试。")
-                return
-            code = L.wait_scan(uuid_, {"telegram": self.token,
-                                       "telegram_chat_id": chat_id},
-                               qr_url, local_qr_path=None)
-            self.send(chat_id, "✅ 已确认, 正在换取新凭证…")
-            data, aduid, resp_headers = L.exchange_token(code)
+            await self._send(chat_id, "🔐 正在生成微信登录二维码…")
+            uuid_, qr_url = await asyncio.to_thread(L.wx_new_qr)
+            await self.app.bot.send_photo(
+                chat_id, qr_url, caption="用手机微信扫这张图, 点【确认登录】(约4分钟有效)")
+            code = await self._wait_scan(chat_id, uuid_, qr_url, L)
+            await self._send(chat_id, "✅ 已确认, 正在换取新凭证…")
+            data, aduid, resp_headers = await asyncio.to_thread(L.exchange_token, code)
             if not data.get("succeeded"):
-                self.send(chat_id, "❌ 换取凭证失败: %s" % json.dumps(data, ensure_ascii=False)[:200])
+                await self._send(chat_id, "❌ 换取凭证失败: %s"
+                                 % json.dumps(data, ensure_ascii=False)[:200])
                 return
             token, _ = L.extract_token(data, resp_headers)
             if not token:
-                self.send(chat_id, "❌ 响应里没找到凭证, 请看服务日志。")
+                await self._send(chat_id, "❌ 响应里没找到凭证, 请看服务日志。")
                 return
             me = ((data.get("resp_data") or {}).get("user") or {})
-            with open(self.s.cred_path, "w", encoding="utf-8") as f:
-                json.dump({"access_token": token, "aduid": aduid,
-                           "login_way": "wechat_qr_bot",
-                           "login_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                           "_user": me}, f, ensure_ascii=False, indent=1)
-            if self.s.hot_reload_cred():
-                self.send(chat_id, "✅ 登录成功: %s\n新凭证已生效, 哨兵继续盯守, 无需重启。" % me.get("name", "?"))
+            await asyncio.to_thread(self._write_cred, token, aduid, me)
+            if await asyncio.to_thread(self.s.hot_reload_cred):
+                await self._send(chat_id, "✅ 登录成功: %s\n新凭证已生效, 哨兵继续盯守, 无需重启。"
+                                 % me.get("name", "?"))
             else:
-                self.send(chat_id, "⚠️ 新凭证已写入但校验未通过, 请看服务日志。")
+                await self._send(chat_id, "⚠️ 新凭证已写入但校验未通过, 请看服务日志。")
         except Exception as e:
-            self.send(chat_id, "❌ 登录流程出错: %s" % str(e)[:200])
+            await self._send(chat_id, "❌ 登录流程出错: %s" % str(e)[:200])
             log("[!] 机器人扫码登录异常: %r" % e)
         finally:
             self._login_running = False
 
-    # ---- 主循环 ----
+    async def _wait_scan(self, chat_id, uuid_, qr_url, L):
+        """等扫码: 过期或取消就换新码重发, 最多 5 张。"""
+        for attempt in range(1, 6):
+            deadline, scanned = time.time() + 240, False
+            while time.time() < deadline:
+                st, code = await asyncio.to_thread(L.wx_poll_code, uuid_)
+                if st == "ok":
+                    return code
+                if st == "scanned" and not scanned:
+                    scanned = True
+                    await self._send(chat_id, "👀 已扫码, 请在手机微信上点【确认登录】")
+                if st == "canceled":
+                    await self._send(chat_id, "❌ 已取消, 发新二维码")
+                    break
+                await asyncio.sleep(2)
+            if attempt == 5:
+                break
+            uuid_, qr_url = await asyncio.to_thread(L.wx_new_qr)
+            await self.app.bot.send_photo(
+                chat_id, qr_url, caption="⏳ 二维码已过期, 这是新的一张 (第 %d 张), 请扫码" % attempt)
+        raise TimeoutError("等多轮都没人扫码, 放弃")
 
-    def run(self):
-        if not self.token:
-            log("[!] 未配置 Telegram bot token, 机器人菜单不可用")
-            return
-        self.set_menu()
-        log("[+] Telegram 机器人已启动 (命令: /menu /groups /status)")
-        while True:
-            try:
-                d = _tg_call(self.token, "getUpdates",
-                             {"offset": self.offset, "timeout": 30,
-                              "allowed_updates": ["message", "callback_query"]},
-                             timeout=40)
-                for u in d.get("result") or []:
-                    self.offset = max(self.offset, u["update_id"] + 1)
-                    try:
-                        self.handle(u)
-                    except Exception as e:
-                        log("[!] 机器人处理异常: %r" % e)
-            except Exception as e:
-                log("[!] 机器人轮询异常, 5s 后重试: %s" % str(e)[:120])
-                time.sleep(5)
-
-    def handle(self, u):
-        cb = u.get("callback_query")
-        if cb:
-            msg = cb.get("message") or {}
-            chat = msg.get("chat", {}).get("id")
-            # 权限比对必须用 cb["from"] (按按钮的人)。
-            # msg["from"] 是发这条消息的机器人自己 —— 用它会把所有按钮点击都判成未授权。
-            actor = cb.get("from") or {}
-            probe = dict(msg)
-            probe["from"] = actor
-            if not self.allowed(probe):
-                self.send(chat, "⛔ 你不在允许名单里 (你的 ID: %s)。"
-                          "请把它加进 watch.json 的 bot_users。" % actor.get("id"))
-                return
-            self.remember_chat(probe)
-            try:
-                _tg_call(self.token, "answerCallbackQuery", {"callback_query_id": cb["id"]})
-            except Exception:
-                pass
-            data = cb.get("data") or ""
-            if data.startswith("g:"):
-                gid = data[2:]
-                self.send(chat, "「%s」(%s)" % (self.s.gnames.get(gid, gid), gid),
-                          self.kb_group(gid))
-            elif data.startswith("l:"):
-                self.push_latest(chat, data[2:])
-            elif data.startswith("a:"):
-                self.toggle_autopush(chat, data[2:])
-            elif data.startswith("k:"):
-                self.cycle_keep(chat, data[2:])
-            elif data == "login":
-                self.start_login(chat)
-            elif data == "groups":
-                self.send(chat, "你加入的星球 (%d):" % len(self.s.gnames), self.kb_groups())
-            elif data == "status":
-                self.send(chat, self.status_text())
-            elif data == "menu":
-                self.menu(chat)
-            return
-
-        msg = u.get("message")
-        if not msg:
-            return
-        chat = msg.get("chat", {}).get("id")
-        if not self.allowed(msg):
-            self.send(chat, "⛔ 你不在允许名单里 (你的 ID: %s)。"
-                      "请把它加进 watch.json 的 bot_users。" % (msg.get("from") or {}).get("id"))
-            return
-        self.remember_chat(msg)
-        text = (msg.get("text") or "").strip()
-        if text.startswith(("/start", "/menu")):
-            self.menu(chat)
-        elif text.startswith("/groups"):
-            self.send(chat, "你加入的星球 (%d):" % len(self.s.gnames), self.kb_groups())
-        elif text.startswith("/status"):
-            self.send(chat, self.status_text())
-        elif text.startswith("/login"):
-            self.start_login(chat)
-        elif text.startswith("/"):
-            self.menu(chat)
+    def _write_cred(self, token, aduid, me):
+        with open(self.s.cred_path, "w", encoding="utf-8") as f:
+            json.dump({"access_token": token, "aduid": aduid,
+                       "login_way": "wechat_qr_bot",
+                       "login_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "_user": me}, f, ensure_ascii=False, indent=1)

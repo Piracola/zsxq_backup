@@ -250,9 +250,8 @@ class Sentinel:
                 log("    [新话题] %s %s" % (tid, (topic.get("title") or "")[:30]))
                 self.archive_topic(gid, gname, topic)
                 self.save_state()
-                if self.bot and self.autopush_on(gid) and self.bot.admins_or_any_chat():
-                    self.bot.send(self.bot.push_chat_id(),
-                                  _fmt_topic_brief(topic, gname))
+                if self.autopush_on(gid) and self.bot.admins_or_any_chat():
+                    self.bot.push_text(_fmt_topic_brief(topic, gname))
                 if self.cfg.get("notify_new"):
                     self.notify("📥 新话题已备份",
                                 "星球: %s\n标题: %s\n%s" % (
