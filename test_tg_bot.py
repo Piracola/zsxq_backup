@@ -13,6 +13,8 @@
   5 保留条数: 循环切换并真实清理旧文件
   6 投递链路: 哨兵线程 → 机器人事件循环 (重构后最容易断的一根线)
   7 复查节奏: 未到周期不查 / 到期才查 / 拉取失败当轮二次确认 / 判定即告警
+  8 凭证自检缓存: 缓存期内不重复查 / 请求失败或过期才真查
+  9 凭证失效保护: 不把话题误判成被删除, 只发凭证告警
 """
 import asyncio
 import json
@@ -200,10 +202,13 @@ class FakeCli:
 
 
 s2.cli = FakeCli()
+s2.cli.whoami = lambda: {"name": "me"}        # 凭证是好的 → 证明"两次拉不到"才是删除
 s2.notified = []
 s2.notify = lambda title, text="": s2.notified.append(title)
 s2.save_state = lambda: None
-for n in ("recent_keys", "check_topics", "on_missing"):
+s2._auth_fail_ts = s2._last_auth_ok = 0.0
+s2._auth_dirty = False
+for n in ("recent_keys", "check_topics", "on_missing", "auth_ok"):
     setattr(s2, n, getattr(w.Sentinel, n).__get__(s2))
 s2.topic_link = w.Sentinel.topic_link          # staticmethod, 不要绑到实例上
 s2.check_topics()
@@ -212,6 +217,56 @@ check("到期话题同轮拉两次后定性为删除",
       sorted(hit) == ["/v2/topics/bbb"] * 2 + ["/v2/topics/ccc"] * 2
       and s2.state["10001/bbb"].get("deleted") and s2.state["10001/ccc"].get("deleted"))
 check("判定删除即推送通知", len(s2.notified) == 2)
+
+# 8 凭证自检缓存: 缓存期内不重复问 whoami, 请求失败或过期才真查
+class CntCli:
+    def __init__(self):
+        self.n = 0
+
+    def whoami(self):
+        self.n += 1
+        return {"name": "me"}
+
+
+s3 = FakeSentinel()
+s3.cfg = {"auth_cache_ttl": 1800}
+s3.cli = CntCli()
+s3.notified = []
+s3.notify = lambda title, text="": s3.notified.append(title)
+s3._auth_fail_ts = s3._last_auth_ok = 0.0
+s3._auth_dirty = False
+s3.auth_ok = w.Sentinel.auth_ok.__get__(s3)
+check("首次凭证自检真查一次", s3.auth_ok() is True and s3.cli.n == 1)
+check("缓存期内不重复查", s3.auth_ok() is True and s3.cli.n == 1)
+s3._auth_dirty = True
+check("请求失败后强制重验", s3.auth_ok() is True and s3.cli.n == 2)
+s3._last_auth_ok = time.time() - 99999
+check("缓存过期后重验", s3.auth_ok() is True and s3.cli.n == 3)
+s3.cli.whoami = lambda: {}
+check("凭证真失效时返回 False", s3.auth_ok(force=True) is False)
+
+# 9 凭证失效时不要把话题误判成被删除
+s4 = FakeSentinel()
+s4.out = os.path.join(TMP, "deadcred")
+os.makedirs(s4.out, exist_ok=True)
+s4.gnames = {"10001": "星球甲"}
+s4.cfg = {"check_archived": True, "recent_days": 7, "check_interval": 600,
+          "check_batch": 10, "verify_gap": 0, "confirm_gap": 150, "auth_cache_ttl": 0}
+s4.state = {"10001/ddd": {"time": fresh}}
+s4.cli = FakeCli()
+s4.cli.whoami = lambda: {}
+s4.notified = []
+s4.notify = lambda title, text="": s4.notified.append(title)
+s4.save_state = lambda: None
+s4._auth_fail_ts = s4._last_auth_ok = 0.0
+s4._auth_dirty = False
+for n in ("recent_keys", "check_topics", "on_missing", "auth_ok"):
+    setattr(s4, n, getattr(w.Sentinel, n).__get__(s4))
+s4.topic_link = w.Sentinel.topic_link
+s4.check_topics()
+check("凭证失效时不判定删除", not s4.state["10001/ddd"].get("deleted"))
+check("只发凭证失效告警, 不发删除告警",
+      any("凭证" in t for t in s4.notified) and not any("删除" in t for t in s4.notified))
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n全部通过 (%d 项)" % ok)
