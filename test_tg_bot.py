@@ -12,6 +12,7 @@
   4 自动推送: 开启时把星球补进盯守列表并落盘
   5 保留条数: 循环切换并真实清理旧文件
   6 投递链路: 哨兵线程 → 机器人事件循环 (重构后最容易断的一根线)
+  7 复查节奏: 未到周期不查 / 到期才查 / 拉取失败当轮二次确认 / 判定即告警
 """
 import asyncio
 import json
@@ -174,6 +175,43 @@ for _ in range(50):
     time.sleep(0.05)
 check("跨线程投递 (run_coroutine_threadsafe)", got == ["threaded:跨线程"], repr(got))
 loop.call_soon_threadsafe(loop.stop)
+
+# 7 复查节奏: 到周期才查, 拉取失败当轮二次确认
+s2 = FakeSentinel()
+s2.out = os.path.join(TMP, "chk")
+os.makedirs(s2.out, exist_ok=True)
+s2.gnames = {"10001": "星球甲"}
+s2.cfg = {"check_archived": True, "recent_days": 7, "check_interval": 86400,
+          "check_batch": 10, "verify_gap": 0, "confirm_gap": 150, "api_sleep": 1.0}
+fresh = time.strftime("%Y-%m-%dT%H:%M:%S")
+nowt = time.time()
+s2.state = {
+    "10001/aaa": {"time": fresh, "last_check": nowt},          # 刚查过 → 应跳过
+    "10001/bbb": {"time": fresh, "last_check": nowt - 90000},  # 已过复查周期 → 应查
+    "10001/ccc": {"time": fresh},                              # 从未查过 → 应查
+}
+hit = []
+
+
+class FakeCli:
+    def req(self, path, retries=3):
+        hit.append(path)
+        return {"succeeded": False, "error": "HTTP 403"}
+
+
+s2.cli = FakeCli()
+s2.notified = []
+s2.notify = lambda title, text="": s2.notified.append(title)
+s2.save_state = lambda: None
+for n in ("recent_keys", "check_topics", "on_missing"):
+    setattr(s2, n, getattr(w.Sentinel, n).__get__(s2))
+s2.topic_link = w.Sentinel.topic_link          # staticmethod, 不要绑到实例上
+s2.check_topics()
+check("未到复查周期的话题不碰", not any(p.endswith("/aaa") for p in hit))
+check("到期话题同轮拉两次后定性为删除",
+      sorted(hit) == ["/v2/topics/bbb"] * 2 + ["/v2/topics/ccc"] * 2
+      and s2.state["10001/bbb"].get("deleted") and s2.state["10001/ccc"].get("deleted"))
+check("判定删除即推送通知", len(s2.notified) == 2)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n全部通过 (%d 项)" % ok)
