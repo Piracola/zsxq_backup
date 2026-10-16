@@ -31,6 +31,7 @@ DEFAULT_CFG = {
     "check_interval": 600,     # 单条话题的复查周期(秒): 距上次检查不足这么久就跳过
     "check_batch": 10,         # 每轮最多复查几条, 把复查摊开, 免得单轮请求扎堆
     "verify_gap": 5,           # 复查拉取失败后隔几秒重试; 两次都失败才判定被删除
+    "auth_cache_ttl": 1800,    # 凭证自检结果复用秒数(省掉每轮一次 whoami); 0 = 每轮都查
     "recent_days": 3,          # 只复查最近 N 天归档的话题 (仅 check_archived 为真时生效)
     "check_archived": True,    # 是否复查已入库话题(删除/篡改监测); False = 只抓最新, 下过的永不再读
     "quiet_hours": [0, 0],     # 夜间静默 [起, 止] 本地小时, 支持跨零点 [22,6]; 起=止 表示不静默
@@ -81,6 +82,7 @@ class Sentinel:
         self.gnames = {}          # gid -> 名称
         self._auth_fail_ts = 0.0  # 凭证告警冷却
         self._last_auth_ok = 0.0  # 最近一次凭证校验通过的时间
+        self._auth_dirty = False  # 有请求失败 → 下一轮强制重验凭证, 不吃缓存
         self.bot = None           # Telegram 机器人线程 (main 里启动)
 
     # ---------- 基础 ----------
@@ -89,7 +91,14 @@ class Sentinel:
         json.dump(self.state, open(self.state_path, "w", encoding="utf-8"),
                   ensure_ascii=False, indent=1)
 
-    def auth_ok(self):
+    def auth_ok(self, force=False):
+        """凭证自检。auth_cache_ttl 秒内直接复用上次结果, 不再每轮都问 whoami。
+        任何数据请求失败会把 _auth_dirty 置位, 此时不吃缓存、立刻真查一次。"""
+        ttl = max(0, int(self.cfg.get("auth_cache_ttl", 1800)))
+        if not force and not self._auth_dirty and ttl and \
+                (time.time() - self._last_auth_ok) < ttl:
+            return True
+        self._auth_dirty = False
         me = self.cli.whoami()
         if me.get("name"):
             self._last_auth_ok = time.time()
@@ -198,6 +207,7 @@ class Sentinel:
         d = self.cli.req("/v2/groups/%s/topics?scope=all&count=%d" % (gid, count))
         if not d.get("succeeded"):
             log("    [!] %s 最新列表拉取失败: %s" % (gid, str(d.get("error"))[:80]))
+            self._auth_dirty = True      # 拉不动 → 下轮不吃凭证缓存, 真查一次
             return []
         return ((d.get("resp_data") or {}).get("topics")) or []
 
@@ -309,6 +319,11 @@ class Sentinel:
                 if d2.get("succeeded"):
                     d = d2
                 else:
+                    # 两次都拉不到: 先排除"凭证失效"这个最常见的原因, 免得把整个归档误判成被删除
+                    if not self.auth_ok(force=True):
+                        self._auth_dirty = True
+                        log("    [!] 凭证不可用, 暂不判定删除: %s" % tid)
+                        continue
                     self.on_missing(gid, tid, key, d2, gap, force_confirm=True)
                     continue
             self.on_detail(gid, tid, key, ((d.get("resp_data") or {}).get("topic") or {}))
