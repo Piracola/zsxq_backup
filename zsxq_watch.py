@@ -28,8 +28,12 @@ API = "https://api.zsxq.com"
 DEFAULT_CFG = {
     "groups": [],              # 要盯的星球 ID 列表; 命令行 --group 优先
     "poll_interval": 30,       # 新话题轮询间隔 (秒); 实际会加 ±25% 抖动, 避免请求过于规律
-    "check_interval": 600,     # 滚动复查节奏 (秒): 每轮检查"距上次检查最久"的一批
-    "recent_days": 3,          # 只复查最近 N 天归档的话题
+    "check_interval": 600,     # 单条话题的复查周期(秒): 距上次检查不足这么久就跳过
+    "check_batch": 10,         # 每轮最多复查几条, 把复查摊开, 免得单轮请求扎堆
+    "verify_gap": 5,           # 复查拉取失败后隔几秒重试; 两次都失败才判定被删除
+    "recent_days": 3,          # 只复查最近 N 天归档的话题 (仅 check_archived 为真时生效)
+    "check_archived": True,    # 是否复查已入库话题(删除/篡改监测); False = 只抓最新, 下过的永不再读
+    "quiet_hours": [0, 0],     # 夜间静默 [起, 止] 本地小时, 支持跨零点 [22,6]; 起=止 表示不静默
     "confirm_gap": 150,        # 删除判定: 两轮确认的最小间隔 (秒), 防瞬时误报
     "notify_new": False,       # 新话题是否也发通知
     "bot_users": [],           # Telegram 机器人允许的 Telegram 用户 ID (数字); 空则允许所有私聊用户
@@ -281,35 +285,46 @@ class Sentinel:
         return out
 
     def check_topics(self):
+        # check_archived=false: 已入库的话题一律不再复查(省掉全部复查流量)。
+        if not self.cfg.get("check_archived", True):
+            return
+        now = time.time()
         gap = self.cfg.get("confirm_gap", 150)
-        days = self.cfg.get("recent_days", 3)
-        keys = self.recent_keys(days)
+        interval = max(60, int(self.cfg.get("check_interval", 600)))  # 单条话题的复查周期
+        batch = max(1, int(self.cfg.get("check_batch", 10)))          # 每轮最多查几条
+        # 只复查"窗口内 且 已到复查周期"的话题; 先查距上次检查最久的
+        keys = [k for k in self.recent_keys(self.cfg.get("recent_days", 7))
+                if now - self.state[k].get("last_check", 0) >= interval]
         if not keys:
             return
-        # 滚动复查: 每轮只查"距上次检查最久"的一批, 避免话题多时单轮请求数爆炸
-        budget = max(10, int(self.cfg.get("check_interval", 300)
-                             / max(0.2, self.cfg.get("api_sleep", 1.0)) * 0.4))
         keys.sort(key=lambda k: self.state[k].get("last_check", 0))
-        for key in keys[:budget]:
+        for key in keys[:batch]:
             gid, tid = key.split("/", 1)
             self.state[key]["last_check"] = time.time()
             d = self.cli.req("/v2/topics/%s" % tid)
-            if d.get("succeeded"):
-                self.on_detail(gid, tid, key, ((d.get("resp_data") or {}).get("topic") or {}))
-            else:
-                self.on_missing(gid, tid, key, d, gap)
+            if not d.get("succeeded"):
+                # 拉取异常先别定性: 隔几秒再拉一次, 两次都拿不到才算真出问题
+                time.sleep(max(0.0, float(self.cfg.get("verify_gap", 5))))
+                d2 = self.cli.req("/v2/topics/%s" % tid)
+                if d2.get("succeeded"):
+                    d = d2
+                else:
+                    self.on_missing(gid, tid, key, d2, gap, force_confirm=True)
+                    continue
+            self.on_detail(gid, tid, key, ((d.get("resp_data") or {}).get("topic") or {}))
         self.save_state()
 
-    def on_missing(self, gid, tid, key, resp, gap):
+    def on_missing(self, gid, tid, key, resp, gap, force_confirm=False):
         v = self.state[key]
         now = time.time()
         seen = v.get("gone_seen") or 0
-        if not seen:
-            v["gone_seen"] = now
-            log("    [?] 话题疑似消失, 待二次确认: %s" % tid)
-            return
-        if now - seen < gap:
-            return
+        if not force_confirm:
+            if not seen:
+                v["gone_seen"] = now
+                log("    [?] 话题疑似消失, 待二次确认: %s" % tid)
+                return
+            if now - seen < gap:
+                return
         # 两轮确认仍不存在 → 判定被删除
         rec = {"topic_id": tid, "group_id": gid, "group": self.gnames.get(gid, gid),
                "title": "", "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -406,7 +421,16 @@ class Sentinel:
         if not self.cfg["groups"]:
             log("[x] 没有配置星球 (--group 或 watch.json 的 groups)"); return 1
         next_run = 0.0
+        qs, qe = (list(self.cfg.get("quiet_hours") or [0, 0]) + [0, 0])[:2]
+        if qs != qe:
+            log("[·] 夜间静默 %d:00-%d:00 不轮询 (机器人线程仍在线)" % (qs, qe))
         while True:
+            # 夜间静默: 只停轮询, 机器人照常在线 —— 夜里还能用 /menu, 只是不抓新内容
+            if qs != qe:
+                h = time.localtime().tm_hour
+                if (qs <= h < qe) if qs < qe else (h >= qs or h < qe):
+                    time.sleep(60)
+                    continue
             # 到点才干活: 实际节奏 = poll_interval ±25%, 不是死循环硬刷
             now = time.time()
             if now < next_run:
