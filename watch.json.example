@@ -1,9 +1,14 @@
 {
   "groups": ["12345678901234"],
   "poll_interval": 30,
+  "check_archived": true,
   "check_interval": 600,
+  "check_batch": 10,
+  "verify_gap": 5,
+  "auth_cache_ttl": 1800,
   "recent_days": 3,
   "confirm_gap": 150,
+  "quiet_hours": [0, 0],
   "notify_new": false,
   "bot_users": [],
   "notify": {

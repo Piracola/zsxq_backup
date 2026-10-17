@@ -15,6 +15,7 @@
   7 复查节奏: 未到周期不查 / 到期才查 / 拉取失败当轮二次确认 / 判定即告警
   8 凭证自检缓存: 缓存期内不重复查 / 请求失败或过期才真查
   9 凭证失效保护: 不把话题误判成被删除, 只发凭证告警
+  10 问答图片: 提问/回答图片分组, 最新推送带图
 """
 import asyncio
 import json
@@ -151,10 +152,12 @@ sent.rebuild_index = lambda: None
 
 got = []
 sent.bot = bot
-bot.push_text = lambda text: got.append(text)
+pushed = []
+bot.push_topic = lambda topic, gname: pushed.append((topic, gname))
 bot.autopush["10001"] = True
 sent.poll_new()
-check("新话题投递到机器人", len(got) == 1 and "正文" in got[0])
+check("新话题投递到机器人", len(pushed) == 1
+      and "正文" in tg_bot._fmt_topic_brief(pushed[0][0], pushed[0][1]))
 
 # 跨线程投递本身 (loop 在别的线程里跑)
 loop = asyncio.new_event_loop()
@@ -267,6 +270,35 @@ s4.check_topics()
 check("凭证失效时不判定删除", not s4.state["10001/ddd"].get("deleted"))
 check("只发凭证失效告警, 不发删除告警",
       any("凭证" in t for t in s4.notified) and not any("删除" in t for t in s4.notified))
+
+# 10 问答图片: 提问图片在 question.images, 和 talk.images 不是同一个字段
+qa = {"topic_id": "888", "create_time": "2026-10-15T11:00:00", "title": "提问预览",
+      "question": {"text": "问题", "owner": {"name": "读者"},
+                   "images": [{"large": {"url": "https://img.example/q1.jpg"}},
+                              {"large": {"url": "https://img.example/q2.jpg"}}]},
+      "answer": {"text": "回答", "owner": {"name": "星主"},
+                 "images": [{"original": {"url": "https://img.example/a1.jpg"}}]}}
+qa_groups = tg_bot._topic_image_groups(qa)
+check("问答图片按提问/回答分组",
+      [g[0] for g in qa_groups] == ["提问附图", "回答附图"]
+      and qa_groups[0][1] == ["https://img.example/q1.jpg", "https://img.example/q2.jpg"]
+      and qa_groups[1][1] == ["https://img.example/a1.jpg"])
+
+sent_pics = []
+
+
+async def _keep_text(chat_id, text, kb=None):
+    return None
+
+
+async def _keep_pics(chat_id, groups):
+    sent_pics.append(groups)
+
+
+bot._send, bot._send_images = _keep_text, _keep_pics
+s.latest_page = lambda gid, count=10: [qa]
+asyncio.run(bot.push_latest(555, "10001", 1))
+check("最新话题推送带问答图片", sent_pics and sent_pics[0] == qa_groups)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n全部通过 (%d 项)" % ok)

@@ -26,7 +26,7 @@ import urllib.parse
 
 import telegram
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
-                      LinkPreviewOptions)
+                      InputMediaPhoto, LinkPreviewOptions)
 from telegram.constants import ParseMode
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler,
                           CommandHandler, MessageHandler, filters)
@@ -123,6 +123,42 @@ def _fmt_topic_brief(topic, gname, with_body=True):
     return "\n".join(L)
 
 
+def _img_url(im):
+    """一张图 → 最合适的 URL: large(约 800px) → original → thumbnail。"""
+    if not isinstance(im, dict):
+        return ""
+    for key in ("large", "original", "thumbnail"):
+        v = im.get(key)
+        if isinstance(v, dict) and v.get("url"):
+            return v["url"]
+    return ""
+
+
+def _topic_image_groups(topic):
+    """按内容区块分组返回图片 URL, 顺序与正文一致。
+    问答话题的提问图片在 question.images, 和 talk.images 不是同一个字段。"""
+    groups = []
+
+    def take(label, node):
+        if not isinstance(node, dict):
+            return
+        urls, seen = [], set()
+        for im in (node.get("images") or []):
+            u = _img_url(im)
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+        if urls:
+            groups.append((label, urls))
+
+    take("提问附图", topic.get("question"))
+    take("回答附图", topic.get("answer"))
+    take("正文附图", topic.get("talk"))
+    take("作业附图", topic.get("task"))
+    take("解答附图", topic.get("solution"))
+    return groups
+
+
 class TgBot(threading.Thread):
     """Telegram 机器人线程。共享 Sentinel 实例读星球列表/备份状态,
     并把阻塞操作丢到线程池, 保持菜单响应。"""
@@ -198,6 +234,16 @@ class TgBot(threading.Thread):
         except Exception as e:
             log("[!] 推送投递失败: %s" % str(e)[:120])
 
+    def push_topic(self, topic, gname):
+        """哨兵 (同步线程) 调用: 推一条话题的正文, 再把提问/回答/正文里的图发出去。"""
+        chat = self.push_chat_id()
+        if not (chat and self._loop and self.app):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._send_topic(chat, topic, gname), self._loop)
+        except Exception as e:
+            log("[!] 推送投递失败: %s" % str(e)[:120])
+
     # ---- 发送 ----
 
     async def _send(self, chat_id, text, kb=None):
@@ -206,6 +252,34 @@ class TgBot(threading.Thread):
                                             link_preview_options=NOPREVIEW, reply_markup=kb)
         except Exception as e:
             log("[!] Telegram 发送失败: %s" % str(e)[:150])
+
+    async def _send_topic(self, chat_id, topic, gname):
+        await self._send(chat_id, _fmt_topic_brief(topic, gname))
+        await self._send_images(chat_id, _topic_image_groups(topic))
+
+    async def _send_images(self, chat_id, groups):
+        """按区块发图。Telegram 相册一组最多 10 张; 组发失败就逐张补发。"""
+        for label, urls in groups or []:
+            for i in range(0, len(urls), 10):
+                chunk = urls[i:i + 10]
+                first = (i == 0)
+                try:
+                    if len(chunk) == 1:
+                        await self.app.bot.send_photo(
+                            chat_id, chunk[0], caption=label if first else None)
+                    else:
+                        media = [InputMediaPhoto(u) for u in chunk]
+                        if first:
+                            media[0] = InputMediaPhoto(chunk[0], caption=label)
+                        await self.app.bot.send_media_group(chat_id, media)
+                except Exception as e:
+                    log("[!] 图片推送失败 (%s): %s" % (label, str(e)[:120]))
+                    for j, u in enumerate(chunk):
+                        try:
+                            await self.app.bot.send_photo(
+                                chat_id, u, caption=label if first and j == 0 else None)
+                        except Exception as e2:
+                            log("[!] 单张图片推送失败: %s" % str(e2)[:100])
 
     async def _show(self, query, text, kb=None):
         """按钮导航: 尽量就地改这条消息, 改不动就新发一条。"""
@@ -394,6 +468,7 @@ class TgBot(threading.Thread):
             return
         for t in topics:
             await self._send(chat_id, _fmt_topic_brief(t, gname))
+            await self._send_images(chat_id, _topic_image_groups(t))
             await asyncio.sleep(0.6)
 
     def toggle_autopush(self, gid):

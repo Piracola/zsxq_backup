@@ -21,7 +21,7 @@ zsxq_watch.py — 知识星球云端哨兵
 import argparse, json, os, random, sys, time, urllib.parse, urllib.request
 from zsxq_archive import (Client, download, collect_images, collect_files,
                           render_md, topic_filename, safe_name, log)
-from tg_bot import TgBot, _fmt_topic_brief
+from tg_bot import TgBot
 
 API = "https://api.zsxq.com"
 
@@ -265,7 +265,7 @@ class Sentinel:
                 self.archive_topic(gid, gname, topic)
                 self.save_state()
                 if self.autopush_on(gid) and self.bot.admins_or_any_chat():
-                    self.bot.push_text(_fmt_topic_brief(topic, gname))
+                    self.bot.push_topic(topic, gname)
                 if self.cfg.get("notify_new"):
                     self.notify("📥 新话题已备份",
                                 "星球: %s\n标题: %s\n%s" % (
@@ -322,8 +322,8 @@ class Sentinel:
                     # 两次都拉不到: 先排除"凭证失效"这个最常见的原因, 免得把整个归档误判成被删除
                     if not self.auth_ok(force=True):
                         self._auth_dirty = True
-                        log("    [!] 凭证不可用, 暂不判定删除: %s" % tid)
-                        continue
+                        log("    [!] 凭证不可用, 暂停本轮剩余复查: %s" % tid)
+                        break
                     self.on_missing(gid, tid, key, d2, gap, force_confirm=True)
                     continue
             self.on_detail(gid, tid, key, ((d.get("resp_data") or {}).get("topic") or {}))
