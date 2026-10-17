@@ -5,7 +5,7 @@ tg_bot.py — 哨兵的 Telegram 机器人 (python-telegram-bot 22.x)
 
 线程模型
   机器人跑在哨兵进程内的独立线程里, 自带一个 asyncio 事件循环 (run_polling)。
-  哨兵是同步世界, 通过 push_text() 把内容投递进那个循环, 互不阻塞。
+  哨兵是同步世界, 通过 push_text()/push_topic() 把内容投递进那个循环, 互不阻塞。
   所有 zsxq 侧的阻塞调用 (拉话题、扫码轮询、清理文件) 一律用 asyncio.to_thread
   丢出事件循环 —— 所以菜单在拉取期间依然响应。
 
