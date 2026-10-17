@@ -12,7 +12,7 @@
   4 自动推送: 开启时把星球补进盯守列表并落盘
   5 保留条数: 循环切换并真实清理旧文件
   6 投递链路: 哨兵线程 → 机器人事件循环 (重构后最容易断的一根线)
-  7 复查节奏: 未到周期不查 / 到期才查 / 拉取失败当轮二次确认 / 判定即告警
+  7 复查节奏: 未到周期不查 / 到期才查 / 明确删除当轮确认 / 限流不当场定性
   8 凭证自检缓存: 缓存期内不重复查 / 请求失败或过期才真查
   9 凭证失效保护: 不把话题误判成被删除, 只发凭证告警
   10 问答图片: 提问/回答图片分组, 最新推送带图
@@ -201,7 +201,7 @@ hit = []
 class FakeCli:
     def req(self, path, retries=3):
         hit.append(path)
-        return {"succeeded": False, "error": "HTTP 403"}
+        return {"succeeded": False, "code": 1007, "error": "主题不存在或已被删除"}
 
 
 s2.cli = FakeCli()
@@ -220,6 +220,42 @@ check("到期话题同轮拉两次后定性为删除",
       sorted(hit) == ["/v2/topics/bbb"] * 2 + ["/v2/topics/ccc"] * 2
       and s2.state["10001/bbb"].get("deleted") and s2.state["10001/ccc"].get("deleted"))
 check("判定删除即推送通知", len(s2.notified) == 2)
+
+# 7b 限流/5xx 没有"话题不存在"的明确信号 → 不应当场判定删除
+s5 = FakeSentinel()
+s5.out = os.path.join(TMP, "busy")
+os.makedirs(s5.out, exist_ok=True)
+s5.gnames = {"10001": "星球甲"}
+s5.cfg = {"check_archived": True, "recent_days": 7, "check_interval": 86400,
+          "check_batch": 10, "verify_gap": 0, "confirm_gap": 150}
+s5.state = {"10001/eee": {"time": fresh}}
+
+
+class FakeCliBusy:
+    def req(self, path, retries=3):
+        return {"succeeded": False, "error": "HTTP 403"}
+
+    def whoami(self):
+        return {"name": "me"}
+
+
+s5.cli = FakeCliBusy()
+s5.notified = []
+s5.notify = lambda title, text="": s5.notified.append(title)
+s5.save_state = lambda: None
+s5._auth_fail_ts = s5._last_auth_ok = 0.0
+s5._auth_dirty = False
+for n in ("recent_keys", "check_topics", "on_missing", "auth_ok"):
+    setattr(s5, n, getattr(w.Sentinel, n).__get__(s5))
+s5.topic_link = w.Sentinel.topic_link
+s5.check_topics()
+check("限流/5xx 不当场判定删除",
+      not s5.state["10001/eee"].get("deleted")
+      and s5.state["10001/eee"].get("gone_seen"))
+s5.on_missing("10001", "eee", "10001/eee",
+              {"succeeded": False, "error": "HTTP 403"}, 150, force_confirm=True)
+check("异常响应即使走到确认点也不判删除",
+      not s5.state["10001/eee"].get("deleted"))
 
 # 8 凭证自检缓存: 缓存期内不重复问 whoami, 请求失败或过期才真查
 class CntCli:

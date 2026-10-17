@@ -25,12 +25,24 @@ from tg_bot import TgBot
 
 API = "https://api.zsxq.com"
 
+
+def _topic_gone(resp):
+    """接口明确说"话题不存在/已删除"才算删除信号 (code 1007)。
+    限流、5xx、网络错误、权限问题都不算 —— 这些留到下一轮复核, 别误报。"""
+    try:
+        if int(resp.get("code")) == 1007:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "不存在或已被删除" in str(resp.get("error") or "")
+
+
 DEFAULT_CFG = {
     "groups": [],              # 要盯的星球 ID 列表; 命令行 --group 优先
     "poll_interval": 30,       # 新话题轮询间隔 (秒); 实际会加 ±25% 抖动, 避免请求过于规律
     "check_interval": 600,     # 单条话题的复查周期(秒): 距上次检查不足这么久就跳过
     "check_batch": 10,         # 每轮最多复查几条, 把复查摊开, 免得单轮请求扎堆
-    "verify_gap": 5,           # 复查拉取失败后隔几秒重试; 两次都失败才判定被删除
+    "verify_gap": 5,           # 复查拉取失败后隔几秒重试; 两次都失败时先排除凭证, 再看接口是否明确说话题不存在
     "auth_cache_ttl": 1800,    # 凭证自检结果复用秒数(省掉每轮一次 whoami); 0 = 每轮都查
     "recent_days": 3,          # 只复查最近 N 天归档的话题 (仅 check_archived 为真时生效)
     "check_archived": True,    # 是否复查已入库话题(删除/篡改监测); False = 只抓最新, 下过的永不再读
@@ -308,6 +320,7 @@ class Sentinel:
         if not keys:
             return
         keys.sort(key=lambda k: self.state[k].get("last_check", 0))
+        auth_checked = False
         for key in keys[:batch]:
             gid, tid = key.split("/", 1)
             self.state[key]["last_check"] = time.time()
@@ -320,11 +333,18 @@ class Sentinel:
                     d = d2
                 else:
                     # 两次都拉不到: 先排除"凭证失效"这个最常见的原因, 免得把整个归档误判成被删除
-                    if not self.auth_ok(force=True):
-                        self._auth_dirty = True
-                        log("    [!] 凭证不可用, 暂停本轮剩余复查: %s" % tid)
-                        break
-                    self.on_missing(gid, tid, key, d2, gap, force_confirm=True)
+                    # 每轮最多真查一次 whoami, 删除一片话题时也不会跟着打一串凭证请求
+                    if not auth_checked:
+                        if not self.auth_ok(force=True):
+                            self._auth_dirty = True
+                            log("    [!] 凭证不可用, 暂停本轮剩余复查: %s" % tid)
+                            break
+                        auth_checked = True
+                    if _topic_gone(d2):
+                        self.on_missing(gid, tid, key, d2, gap, force_confirm=True)
+                    else:
+                        # 没有"话题不存在"的明确信号: 按跨轮复核处理, 免得把限流/5xx误判成删除
+                        self.on_missing(gid, tid, key, d2, gap)
                     continue
             self.on_detail(gid, tid, key, ((d.get("resp_data") or {}).get("topic") or {}))
         self.save_state()
@@ -336,11 +356,16 @@ class Sentinel:
         if not force_confirm:
             if not seen:
                 v["gone_seen"] = now
-                log("    [?] 话题疑似消失, 待二次确认: %s" % tid)
+                log("    [?] 拉取异常, 继续观察: %s" % tid)
                 return
             if now - seen < gap:
                 return
-        # 两轮确认仍不存在 → 判定被删除
+        if not _topic_gone(resp):
+            # 限流/5xx/网络异常没有"话题不存在"的明确信号: 继续观察, 不当成删除
+            v["gone_seen"] = now
+            log("    [?] 拉取异常, 继续观察: %s" % tid)
+            return
+        # 连续确认接口明确报"话题不存在" → 判定被删除
         rec = {"topic_id": tid, "group_id": gid, "group": self.gnames.get(gid, gid),
                "title": "", "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                "api_resp": resp}
