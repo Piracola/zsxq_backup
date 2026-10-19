@@ -20,7 +20,7 @@
 | 命令 | 功能 |
 | --- | --- |
 | `/menu` | 主菜单 |
-| `/groups` | 列出账号加入的所有星球 |
+| `/groups` | 列出账号加入的所有星球(名单没拉到时当场拉一次;拉不到会提示凭证可能失效) |
 | `/status` | 备份条数、删除记录、各星球开关状态 |
 | `/login` | 生成微信登录二维码发给你,扫码后新凭证自动生效 |
 
@@ -52,10 +52,12 @@
 git clone https://github.com/Piracola/zsxq_backup /opt/zsxq && cd /opt/zsxq
 pip3 install -r requirements.txt          # python-telegram-bot + pycryptodome
 cp watch.json.example watch.json
-vi watch.json        # 填 groups(星球ID)、notify.telegram(bot token 和你的 chat_id)
+vi watch.json        # 至少填 notify.telegram(bot token 和你的 chat_id); groups 可以先留空
 python3 -X utf8 test_tg_bot.py           # 自检: 不联网, 验证机器人逻辑
 python3 -X utf8 zsxq_watch.py --once     # 试跑一轮
 ```
+
+`groups` 留空也能起:服务照常在线,机器人在 `/groups` 里挑一个星球打开自动推送,它就会自己进盯守名单。
 
 常驻(推荐 systemd):
 

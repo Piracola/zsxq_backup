@@ -16,7 +16,8 @@
   8 检测并入抓取轮: 列表里的老话题零请求比对 / 窗口内缺席才确认 / 掉出窗口不碰
   9 限流与凭证失效: 都不许把话题误判成被删除
   10 凭证自检缓存: 缓存期内不重复查 / 请求失败或过期才真查
-  11 问答图片: 提问/回答图片分组, 最新推送带图
+  11 /groups: 名单没填上时当场拉 / 拉不到给出凭证提示
+  12 问答图片: 提问/回答图片分组, 最新推送带图
 """
 import asyncio
 import json
@@ -334,7 +335,46 @@ check("凭证失效时不判定删除", not s4.state["10001/ddd"].get("deleted")
 check("只发凭证失效告警, 不发删除告警",
       any("凭证" in t for t in s4.notified) and not any("删除" in t for t in s4.notified))
 
-# 10 问答图片: 提问图片在 question.images, 和 talk.images 不是同一个字段
+# 10 /groups: 名单是抓取循环顺手填的, 还没填上要当场拉, 拉不到要说清原因
+class GroupCli:
+    def __init__(self):
+        self.n = 0
+
+    def groups(self):
+        self.n += 1
+        return [{"group_id": "10001", "name": "星球甲"}]
+
+
+s6 = fake_sentinel()
+s6.gnames = {}                       # 刚装好、循环还没跑起来的样子
+for n in ("refresh_groups", "ensure_groups"):
+    setattr(s6, n, getattr(w.Sentinel, n).__get__(s6))
+s6.cli = GroupCli()
+b6 = tg_bot.TgBot.__new__(tg_bot.TgBot)
+b6.s = s6
+txt = asyncio.run(b6.groups_text())
+check("名单为空时当场拉一次",
+      s6.cli.n == 1 and s6.gnames == {"10001": "星球甲"} and "你加入的星球 (1)" in txt)
+asyncio.run(b6.groups_text())
+check("名单已有就不重复拉", s6.cli.n == 1)
+
+
+class NoGroupCli:
+    def groups(self):
+        return []
+
+
+s7 = fake_sentinel()
+s7.gnames = {}
+for n in ("refresh_groups", "ensure_groups"):
+    setattr(s7, n, getattr(w.Sentinel, n).__get__(s7))
+s7.cli = NoGroupCli()
+b7 = tg_bot.TgBot.__new__(tg_bot.TgBot)
+b7.s = s7
+check("拉不到时给出凭证提示", asyncio.run(b7.groups_text()) == tg_bot.GROUPS_EMPTY)
+check("拉不到时按钮回到主菜单", b7.kb_groups().inline_keyboard[0][0].callback_data == "groups")
+
+# 11 问答图片: 提问图片在 question.images, 和 talk.images 不是同一个字段
 qa = {"topic_id": "888", "create_time": "2026-10-15T11:00:00", "title": "提问预览",
       "question": {"text": "问题", "owner": {"name": "读者"},
                    "images": [{"large": {"url": "https://img.example/q1.jpg"}},

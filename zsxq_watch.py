@@ -111,6 +111,7 @@ class Sentinel:
         self.cli = Client(cred["access_token"], cred.get("aduid"),
                           sleep=max(0.2, cfg.get("api_sleep", 1.0)))
         self.gnames = {}          # gid -> 名称
+        self._groups_at = 0.0     # 上次拉星球名单的时间
         self._auth_fail_ts = 0.0  # 凭证告警冷却
         self._last_auth_ok = 0.0  # 最近一次凭证校验通过的时间
         self._auth_dirty = False  # 有请求失败 → 下一轮强制重验凭证, 不吃缓存
@@ -171,8 +172,26 @@ class Sentinel:
         return False
 
     def refresh_groups(self):
-        for g in self.cli.groups():
-            self.gnames[str(g.get("group_id"))] = g.get("name") or ""
+        """拉一遍账号里的星球。拉不到就保留原来的名单, 别因此把满名单清成空的。"""
+        got = {str(g.get("group_id")): (g.get("name") or "")
+               for g in self.cli.groups() if g.get("group_id")}
+        if got:
+            self.gnames = got
+        return bool(got)
+
+    def ensure_groups(self, force=False):
+        """星球名单是抓取循环顺手填的, 机器人按钮也可能要用, 所以这里给个 TTL:
+        十分钟内不重复拉。返回名单是否可用。"""
+        if not force and self.gnames and time.time() - self._groups_at < 600:
+            return True
+        try:
+            ok = self.refresh_groups()
+        except Exception as e:
+            log("[!] 拉星球列表失败: %r" % e)
+            return False
+        if ok:
+            self._groups_at = time.time()
+        return ok
 
     def hot_reload_cred(self):
         """扫码登录成功后热替换凭证, 不必重启服务。"""
@@ -186,7 +205,7 @@ class Sentinel:
             me = self.cli.whoami()
             if me.get("name"):
                 self._last_auth_ok = time.time()
-                self.gnames = {}
+                self._groups_at = 0.0        # 换了凭证, 星球名单重新拉一遍
                 return True
         except Exception as e:
             log("[!] 凭证热替换失败: %s" % e)
@@ -492,8 +511,11 @@ class Sentinel:
         if not self.auth_ok():
             log("[x] 凭证失效, 本轮跳过")
             return
-        if not self.gnames:
-            self.refresh_groups()
+        listed = self.ensure_groups()
+        if not listed and not self.gnames:
+            log("[x] 星球名单拉不到, 本轮跳过")
+            return
+        if listed:
             missing = [g for g in self.cfg["groups"] if str(g) not in self.gnames]
             if missing:
                 log("[x] 这些星球不在账号里: %s" % ", ".join(missing))
@@ -524,13 +546,15 @@ class Sentinel:
                 self.prune_group(str(gid), int(keep))
 
     def run(self):
+        self.ensure_groups()               # 先拉星球名字, 日志和机器人菜单都要用
         groups = [str(g) for g in self.cfg["groups"] if g]
-        if not groups:
-            log("[x] 没有配置星球 (--group 或 watch.json 的 groups)")
-            return 1
-        log("[+] 哨兵启动: 盯 %d 个星球, 各按自己的间隔抓" % len(groups))
-        for g in groups:
-            log("    " + self.describe(g))
+        if groups:
+            log("[+] 哨兵启动: 盯 %d 个星球, 各按自己的间隔抓" % len(groups))
+            for g in groups:
+                log("    " + self.describe(g))
+        else:
+            # 一个都没配也照常在线: 机器人里选个星球打开自动推送, 它就自己进盯守名单了
+            log("[!] 还没有配置星球 —— 机器人照常在线, 用 /groups 挑一个开自动推送即可")
         next_run = {}
         while True:
             groups = [str(g) for g in self.cfg["groups"] if g]   # 机器人可能刚加了星球
@@ -585,9 +609,13 @@ def main():
         w.run_once()
         return 0
     # 启动确认: 服务真的跑起来了会发这条, 收到即代表进程活着、凭证有效与否一眼可知
-    w.notify("🟢 星球哨兵已启动",
-             "盯守 %d 个星球, 机器人菜单已就绪 (/menu)。\n抓取节奏可以逐个星球在设置里调。" %
-             len(w.cfg["groups"]))
+    if w.cfg["groups"]:
+        w.notify("🟢 星球哨兵已启动",
+                 "盯守 %d 个星球, 机器人菜单已就绪 (/menu)。\n抓取节奏可以逐个星球在设置里调。" %
+                 len(w.cfg["groups"]))
+    else:
+        w.notify("🟢 星球哨兵已启动",
+                 "还没有配置星球 —— 发 /groups 挑一个打开自动推送, 它就会自动进盯守名单。")
     return w.run()
 
 

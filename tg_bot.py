@@ -41,6 +41,9 @@ MENU_TEXT = ("星球哨兵机器人\n\n🌍 我的星球 — 选星球看内容 
              "📊 哨兵状态 — 备份运行情况与每个星球的节奏\n"
              "🔐 扫码更新凭证 — 凭证过期时点这里, 微信扫码即可\n\n"
              "星球名后面的标记: 🔄=新话题自动推送中 ✂️=只保留近期条数")
+GROUPS_EMPTY = ("没能拉到你的星球列表。\n\n"
+                "通常是凭证失效了: 点下面的「扫码更新凭证」, 或者发 /login。\n"
+                "拉取失败的原始原因在服务日志里。")
 
 
 # ---------- 文本渲染 (HTML parse_mode) ----------
@@ -369,6 +372,8 @@ class TgBot(threading.Thread):
             [InlineKeyboardButton("🔐 扫码更新凭证", callback_data="login")]])
 
     def kb_groups(self):
+        if not self.s.gnames:                    # 名单还没拉上来, 先给回菜单, 别给一排空按钮
+            return self.kb_menu()
         rows = []
         for gid in sorted(self.s.gnames, key=lambda g: self.s.gnames[g]):
             marks = ""
@@ -436,7 +441,7 @@ class TgBot(threading.Thread):
 
     async def cmd_groups(self, update, context):
         await self._send(update.effective_chat.id,
-                         "你加入的星球 (%d):" % len(self.s.gnames), self.kb_groups())
+                         await self.groups_text(), self.kb_groups())
 
     async def cmd_status(self, update, context):
         await self._send(update.effective_chat.id,
@@ -458,7 +463,7 @@ class TgBot(threading.Thread):
     async def cb_groups(self, update, context):
         q = update.callback_query
         await q.answer()
-        await self._show(q, "你加入的星球 (%d):" % len(self.s.gnames), self.kb_groups())
+        await self._show(q, await self.groups_text(), self.kb_groups())
 
     async def cb_status(self, update, context):
         q = update.callback_query
@@ -530,6 +535,18 @@ class TgBot(threading.Thread):
         self.s.set_opt(gid, key, nxt)
         self.save_pref()
 
+    async def groups_text(self):
+        """星球名单正常由抓取循环顺手填好; 万一还是空的就当场拉一次 ——
+        新装的时候第一件事就是 /groups, 这时候循环可能还没跑起来。"""
+        if not self.s.gnames:
+            try:
+                await asyncio.to_thread(self.s.ensure_groups, True)
+            except Exception as e:
+                log("[!] 拉星球列表失败: %r" % e)
+        if not self.s.gnames:
+            return GROUPS_EMPTY
+        return "你加入的星球 (%d):\n点一个进去看内容、开关自动推送、调抓取节奏。" % len(self.s.gnames)
+
     def status_text(self):
         s = self.s
         state = list(s.state.values())          # 快照: 哨兵线程同时在改这个 dict
@@ -537,6 +554,8 @@ class TgBot(threading.Thread):
                  "盯守星球: %d 个" % len(s.cfg["groups"]),
                  "备份话题: %d 条" % len(state),
                  "删除记录: %d 条" % sum(1 for v in state if v.get("deleted"))]
+        if not s.gnames:
+            lines.append("星球名单: 没拉到 (凭证多半失效了, 发 /login)")
         auto = [s.gnames.get(g, g) for g, on in self.autopush.items() if on]
         lines.append("自动推送: %s" % (", ".join(auto) if auto else "未开启"))
         keeps = {g: int(v) for g, v in (s.cfg.get("group_keep") or {}).items() if v}
