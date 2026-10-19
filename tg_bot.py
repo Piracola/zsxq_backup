@@ -12,8 +12,9 @@ tg_bot.py — 哨兵的 Telegram 机器人 (python-telegram-bot 22.x)
 命令
   /start /menu   主菜单      /groups  我的星球
   /status        哨兵状态    /login   微信扫码更新凭证
-星球内按钮: 最新10条 / 自动推送开关 / 保留条数 / 返回
-偏好 (自动推送、chat_id、groups 改动) 持久化在 watch.json, 重启不丢。
+星球内按钮: 最新10条 / 自动推送开关 / 保留条数 / 抓取设置 / 返回
+抓取设置里逐个星球可调: 间隔、每轮页数、复查周期与窗口、评论上限、是否下图。
+偏好 (自动推送、chat_id、groups、保留条数、抓取设置) 持久化在 watch.json, 重启不丢。
 """
 import asyncio
 import html as _html
@@ -36,8 +37,8 @@ from zsxq_archive import E_RE, log
 MAXLEN = 3900                     # Telegram 单条上限 4096, 留出标签余量
 BQ_OPEN, BQ_CLOSE = "<blockquote expandable>", "</blockquote>"
 NOPREVIEW = LinkPreviewOptions(is_disabled=True)
-MENU_TEXT = ("星球哨兵机器人\n\n🌍 我的星球 — 选星球看内容 / 设自动推送 / 设保留条数\n"
-             "📊 哨兵状态 — 备份运行情况\n"
+MENU_TEXT = ("星球哨兵机器人\n\n🌍 我的星球 — 选星球看内容 / 设自动推送 / 保留条数 / 抓取节奏\n"
+             "📊 哨兵状态 — 备份运行情况与每个星球的节奏\n"
              "🔐 扫码更新凭证 — 凭证过期时点这里, 微信扫码即可\n\n"
              "星球名后面的标记: 🔄=新话题自动推送中 ✂️=只保留近期条数")
 
@@ -164,6 +165,13 @@ class TgBot(threading.Thread):
     并把阻塞操作丢到线程池, 保持菜单响应。"""
 
     KEEP_CHOICES = [0, 50, 100, 200, 500, 1000]
+    # 抓取设置的可选项 (键 → 候选值); 接口实测上限: 每轮 30 条
+    OPT_CHOICES = {"poll_interval": [15, 30, 45, 60, 120, 300],
+                   "page_size": [20, 30],
+                   "check_interval": [300, 900, 3600, 21600, 86400, 0],
+                   "recent_days": [1, 3, 7, 30],
+                   "max_comments": [0, 20, 50, 100],
+                   "keep_media": [True, False]}
 
     def __init__(self, sent):
         super().__init__(daemon=True, name="tg-bot")
@@ -192,6 +200,7 @@ class TgBot(threading.Thread):
         a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.cmd_menu))
         for pat, fn in (("^g:", self.cb_group), ("^l:", self.cb_latest),
                         ("^a:", self.cb_autopush), ("^k:", self.cb_keep),
+                        ("^s:", self.cb_set), ("^[ipcdmw]:", self.cb_opt),
                         ("^menu$", self.cb_menu), ("^groups$", self.cb_groups),
                         ("^status$", self.cb_status), ("^login$", self.cb_login),
                         ("^noop$", self.cb_noop)):
@@ -339,6 +348,14 @@ class TgBot(threading.Thread):
             data["bot_autopush"] = self.autopush
             data["bot_chat_id"] = self._chat_id
             data["groups"] = self.s.cfg.get("groups") or []
+            # 星球上设的抓取节奏和保留条数也要落盘, 否则重启即丢
+            keep = {k: v for k, v in (self.s.cfg.get("group_keep") or {}).items() if v}
+            opts = {k: v for k, v in (self.s.cfg.get("group_opts") or {}).items() if v}
+            for key, val in (("group_keep", keep), ("group_opts", opts)):
+                if val:
+                    data[key] = val
+                else:
+                    data.pop(key, None)
             json.dump(data, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         except Exception as e:
             log("[!] 机器人偏好保存失败: %s" % e)
@@ -373,7 +390,44 @@ class TgBot(threading.Thread):
                                   callback_data="a:" + gid)],
             [InlineKeyboardButton(("✂ 只留%d条 ✓" % keep) if keep else "✂ 不限量",
                                   callback_data="k:" + gid)],
+            [InlineKeyboardButton("⚙ 抓取设置", callback_data="s:" + gid)],
             [InlineKeyboardButton("◀ 返回星球列表", callback_data="menu")]])
+
+    def kb_set(self, gid):
+        """抓取设置页: 每一行点一下就换到下一个候选值, 当前值直接写在按钮上。"""
+        g = str(gid)
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏱ 间隔 · %s" % self._fmt_sec(self.s.opt(g, "poll_interval")),
+                                  callback_data="i:" + g)],
+            [InlineKeyboardButton("📄 每轮 · %d 条" % int(self.s.opt(g, "page_size") or 20),
+                                  callback_data="p:" + g)],
+            [InlineKeyboardButton("🔁 复查 · %s" % self._fmt_sec(
+                self.s.opt(g, "check_interval"), zero="关闭"), callback_data="c:" + g)],
+            [InlineKeyboardButton("📅 窗口 · 最近 %d 天" % int(self.s.opt(g, "recent_days") or 0),
+                                  callback_data="d:" + g)],
+            [InlineKeyboardButton("💬 评论 · %s" % self._fmt_comments(self.s.opt(g, "max_comments")),
+                                  callback_data="m:" + g)],
+            [InlineKeyboardButton("🖼 图片附件 · %s" % ("下载" if self.s.opt(g, "keep_media") else "跳过"),
+                                  callback_data="w:" + g)],
+            [InlineKeyboardButton("◀ 返回该星球", callback_data="g:" + g)]])
+
+    @staticmethod
+    def _fmt_sec(v, zero="关闭"):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return "?"
+        if n <= 0:
+            return zero
+        if n < 60:
+            return "%d 秒" % n
+        if n < 3600:
+            return "%d 分" % (n // 60)
+        return "%d 小时" % (n // 3600) if n < 86400 else "%d 天" % (n // 86400)
+
+    @staticmethod
+    def _fmt_comments(v):
+        return "全部" if not int(v or 0) else "%d 条" % int(v)
 
     # ---- 命令 ----
 
@@ -441,7 +495,40 @@ class TgBot(threading.Thread):
         msg = await asyncio.to_thread(self.cycle_keep, gid)      # 清理文件, 别卡住循环
         await self._show(q, msg, self.kb_group(gid))
 
+    async def cb_set(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        gid = q.data.split(":", 1)[1]
+        await self._show(q, self.set_text(gid), self.kb_set(gid))
+
+    async def cb_opt(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        key, gid = q.data.split(":", 1)
+        self.cycle_opt(gid, {"i": "poll_interval", "p": "page_size", "c": "check_interval",
+                             "d": "recent_days", "m": "max_comments",
+                             "w": "keep_media"}[key])
+        await self._show(q, self.set_text(gid), self.kb_set(gid))
+
     # ---- 动作 ----
+
+    def set_text(self, gid):
+        return ("「%s」抓取设置\n\n"
+                "间隔是多久看一眼新内容; 每轮页数决定一次拿多少条 (接口上限 30)。\n"
+                "复查只在窗口内那条话题缺席时才发请求确认, 周期越短发现得越快。\n"
+                "改完立刻生效, 不用重启。\n\n现在: %s"
+                % (self.s.gnames.get(gid, gid), self.s.describe(gid)))
+
+    def cycle_opt(self, gid, key):
+        """轮换某个星球的抓取设置: 候选值里取下一个, 到末尾回到开头。"""
+        choices = self.OPT_CHOICES[key]
+        cur = self.s.opt(gid, key)
+        try:
+            nxt = choices[(choices.index(cur) + 1) % len(choices)]
+        except ValueError:
+            nxt = choices[0]                 # 手动改成候选外的值, 从头开始
+        self.s.set_opt(gid, key, nxt)
+        self.save_pref()
 
     def status_text(self):
         s = self.s
@@ -457,6 +544,10 @@ class TgBot(threading.Thread):
             ", ".join("%s→%d条" % (s.gnames.get(g, g), n) for g, n in keeps.items())
             if keeps else "不限量"))
         lines.append("凭证: %s" % ("有效" if time.time() - s._last_auth_ok < 3600 else "待复核"))
+        lines.append("")
+        lines.append("抓取节奏 (可以逐个改):")
+        for g in s.cfg["groups"]:
+            lines.append("· " + s.describe(str(g)))
         return "\n".join(lines)
 
     async def push_latest(self, chat_id, gid, n=10):

@@ -1,15 +1,23 @@
 {
   "groups": ["12345678901234"],
+
   "poll_interval": 30,
-  "check_archived": true,
+  "page_size": 20,
   "check_interval": 600,
   "check_batch": 10,
-  "verify_gap": 5,
-  "auth_cache_ttl": 1800,
   "recent_days": 3,
-  "confirm_gap": 150,
+  "max_comments": 0,
+  "keep_media": true,
+
   "quiet_hours": [0, 0],
   "notify_new": false,
+  "auth_cache_ttl": 1800,
+
+  "group_opts": {
+    "12345678901234": {"poll_interval": 20, "page_size": 30, "recent_days": 7}
+  },
+  "group_keep": {},
+
   "bot_users": [],
   "notify": {
     "wecom": "",

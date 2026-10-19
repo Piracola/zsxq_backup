@@ -11,11 +11,12 @@
   3 按钮键盘: 星球列表标记 / 单星球菜单
   4 自动推送: 开启时把星球补进盯守列表并落盘
   5 保留条数: 循环切换并真实清理旧文件
-  6 投递链路: 哨兵线程 → 机器人事件循环 (重构后最容易断的一根线)
-  7 复查节奏: 未到周期不查 / 到期才查 / 明确删除当轮确认 / 限流不当场定性
-  8 凭证自检缓存: 缓存期内不重复查 / 请求失败或过期才真查
-  9 凭证失效保护: 不把话题误判成被删除, 只发凭证告警
-  10 问答图片: 提问/回答图片分组, 最新推送带图
+  6 抓取设置: 逐星球覆盖 / 落盘 / 状态里读得回来
+  7 投递链路: 哨兵线程 → 机器人事件循环 (重构后最容易断的一根线)
+  8 检测并入抓取轮: 列表里的老话题零请求比对 / 窗口内缺席才确认 / 掉出窗口不碰
+  9 限流与凭证失效: 都不许把话题误判成被删除
+  10 凭证自检缓存: 缓存期内不重复查 / 请求失败或过期才真查
+  11 问答图片: 提问/回答图片分组, 最新推送带图
 """
 import asyncio
 import json
@@ -53,6 +54,32 @@ def check(name, cond, extra=""):
 
 class FakeSentinel:
     pass
+
+
+def fake_sentinel(**cfg):
+    """造一个只带真实逻辑、不联网的哨兵: 请求由各用例自己的假 Client 顶替。"""
+    s = FakeSentinel()
+    s.out = tempfile.mkdtemp(dir=TMP, prefix="s-")
+    s.state = {}
+    s.gnames = {"10001": "星球甲"}
+    s.cfg = dict(w.DEFAULT_CFG)
+    s.cfg.update(cfg)
+    s.notified = []
+    s.notify = lambda title, text="": s.notified.append(title)
+    s.save_state = lambda: None
+    s._auth_fail_ts = s._last_auth_ok = 0.0
+    s._auth_dirty = False
+    s._last_prune = 0.0
+    s.bot = None
+    s.archive_topic = lambda gid, gname, topic: s.state.__setitem__(
+        "%s/%s" % (gid, topic.get("topic_id")),
+        {"time": topic.get("create_time"), "mtime": topic.get("modify_time") or "",
+         "cc": topic.get("comments_count") or 0})
+    for n in ("opt", "set_opt", "in_quiet", "latest_page", "poll_group", "check_window",
+              "on_detail", "on_deleted", "auth_ok", "describe", "autopush_on"):
+        setattr(s, n, getattr(w.Sentinel, n).__get__(s))
+    s.topic_link = w.Sentinel.topic_link       # staticmethod, 不要绑到实例上
+    return s
 
 
 s = FakeSentinel()
@@ -134,6 +161,20 @@ for i in range(1, 60):
 bot.cycle_keep("10001")
 check("只留 50 条并清理旧文件",
       s.cfg["group_keep"]["10001"] == 50 and len(s.state) == 50 and len(os.listdir(gd)) == 50)
+saved = json.load(open(s.cfg["_config_path"], encoding="utf-8"))
+check("保留条数落盘", saved.get("group_keep", {}).get("10001") == 50)
+
+# 5b 抓取设置: 可以逐个星球改, 改完直接落盘
+for n in ("opt", "set_opt", "describe"):
+    setattr(s, n, getattr(w.Sentinel, n).__get__(s))
+bot.cycle_opt("10001", "poll_interval")
+check("间隔可逐星球覆盖", s.opt("10001", "poll_interval") == 45)
+bot.cycle_opt("10001", "page_size")
+bot.cycle_opt("10001", "max_comments")
+saved = json.load(open(s.cfg["_config_path"], encoding="utf-8"))
+check("抓取设置逐项落盘", saved["group_opts"]["10001"] ==
+      {"poll_interval": 45, "page_size": 30, "max_comments": 20})
+check("状态里读得回节奏", "45" in s.describe("10001") and "30 条" in s.describe("10001"))
 
 # 6 投递链路 (哨兵同步线程 → 机器人事件循环)
 sent_cfg = dict(w.DEFAULT_CFG)
@@ -143,7 +184,7 @@ json.dump({"access_token": "X", "aduid": "Y"}, open(os.path.join(TMP, "cred2.jso
 sent = w.Sentinel(os.path.join(TMP, "cred2.json"), TMP, sent_cfg)
 sent.gnames = {"10001": "星球甲"}
 sent.auth_ok = lambda: True
-sent.latest_page = lambda gid, count=20: [
+sent.latest_page = lambda gid, count=None: [
     {"topic_id": "777", "create_time": "2026-10-15T10:00:00",
      "talk": {"text": "正文", "owner": {"name": "甲"}}}]
 sent.archive_topic = lambda gid, gname, topic: sent.state.__setitem__(
@@ -155,7 +196,7 @@ sent.bot = bot
 pushed = []
 bot.push_topic = lambda topic, gname: pushed.append((topic, gname))
 bot.autopush["10001"] = True
-sent.poll_new()
+sent.poll_group("10001")
 check("新话题投递到机器人", len(pushed) == 1
       and "正文" in tg_bot._fmt_topic_brief(pushed[0][0], pushed[0][1]))
 
@@ -181,54 +222,52 @@ for _ in range(50):
 check("跨线程投递 (run_coroutine_threadsafe)", got == ["threaded:跨线程"], repr(got))
 loop.call_soon_threadsafe(loop.stop)
 
-# 7 复查节奏: 到周期才查, 拉取失败当轮二次确认
-s2 = FakeSentinel()
-s2.out = os.path.join(TMP, "chk")
-os.makedirs(s2.out, exist_ok=True)
-s2.gnames = {"10001": "星球甲"}
-s2.cfg = {"check_archived": True, "recent_days": 7, "check_interval": 86400,
-          "check_batch": 10, "verify_gap": 0, "confirm_gap": 150, "api_sleep": 1.0}
-fresh = time.strftime("%Y-%m-%dT%H:%M:%S")
-nowt = time.time()
+# 8 检测并入抓取轮: 列表里的老话题零请求比对, 窗口内缺席才单独确认
+s2 = fake_sentinel(recent_days=30, check_interval=300, check_batch=10)
+os.makedirs(os.path.join(s2.out, "raw", "10001"), exist_ok=True)
 s2.state = {
-    "10001/aaa": {"time": fresh, "last_check": nowt},          # 刚查过 → 应跳过
-    "10001/bbb": {"time": fresh, "last_check": nowt - 90000},  # 已过复查周期 → 应查
-    "10001/ccc": {"time": fresh},                              # 从未查过 → 应查
+    "10001/alive":    {"time": "2026-10-10T10:00:00", "mtime": "", "cc": 3},
+    "10001/edited":   {"time": "2026-10-11T10:00:00", "mtime": "", "cc": 3},
+    "10001/vanished": {"time": "2026-10-12T10:00:00", "mtime": "", "cc": 3},
+    "10001/old":      {"time": "2026-09-01T10:00:00", "mtime": "", "cc": 3},
 }
-hit = []
+s2.latest_page = lambda gid, count=None: [
+    {"topic_id": "new", "create_time": "2026-10-13T10:00:00", "comments_count": 0},
+    {"topic_id": "edited", "create_time": "2026-10-11T10:00:00", "comments_count": 5,
+     "modify_time": "2026-10-19T08:00:00"},
+    {"topic_id": "alive", "create_time": "2026-10-10T10:00:00", "comments_count": 3}]
 
 
 class FakeCli:
+    def __init__(self):
+        self.hit = []
+
     def req(self, path, retries=3):
-        hit.append(path)
-        return {"succeeded": False, "code": 1007, "error": "主题不存在或已被删除"}
+        self.hit.append(path)
+        if path.endswith("/vanished"):
+            return {"succeeded": False, "code": 1007, "error": "主题不存在或已被删除"}
+        return {"succeeded": True, "resp_data": {"topic": {"comments_count": 5}}}
+
+    def comments(self, tid, limit=0):
+        return []
+
+    def whoami(self):
+        return {"name": "me"}
 
 
 s2.cli = FakeCli()
-s2.cli.whoami = lambda: {"name": "me"}        # 凭证是好的 → 证明"两次拉不到"才是删除
-s2.notified = []
-s2.notify = lambda title, text="": s2.notified.append(title)
-s2.save_state = lambda: None
-s2._auth_fail_ts = s2._last_auth_ok = 0.0
-s2._auth_dirty = False
-for n in ("recent_keys", "check_topics", "on_missing", "auth_ok"):
-    setattr(s2, n, getattr(w.Sentinel, n).__get__(s2))
-s2.topic_link = w.Sentinel.topic_link          # staticmethod, 不要绑到实例上
-s2.check_topics()
-check("未到复查周期的话题不碰", not any(p.endswith("/aaa") for p in hit))
-check("到期话题同轮拉两次后定性为删除",
-      sorted(hit) == ["/v2/topics/bbb"] * 2 + ["/v2/topics/ccc"] * 2
-      and s2.state["10001/bbb"].get("deleted") and s2.state["10001/ccc"].get("deleted"))
-check("判定删除即推送通知", len(s2.notified) == 2)
+s2.poll_group("10001")
+check("列表里已有的老话题不发请求", "/v2/topics/alive" not in s2.cli.hit)
+check("掉出窗口的老话题根本不碰", "/v2/topics/old" not in s2.cli.hit)
+check("窗口内缺席 + 明确报不存在 → 判删除", s2.state["10001/vanished"].get("deleted"))
+check("第一次被编辑也能发现", any("变动" in t for t in s2.notified))
+check("新话题照常入库", "10001/new" in s2.state)
 
-# 7b 限流/5xx 没有"话题不存在"的明确信号 → 不应当场判定删除
-s5 = FakeSentinel()
-s5.out = os.path.join(TMP, "busy")
-os.makedirs(s5.out, exist_ok=True)
-s5.gnames = {"10001": "星球甲"}
-s5.cfg = {"check_archived": True, "recent_days": 7, "check_interval": 86400,
-          "check_batch": 10, "verify_gap": 0, "confirm_gap": 150}
-s5.state = {"10001/eee": {"time": fresh}}
+# 8b 限流/5xx 没有"话题不存在"的明确信号 → 不当成删除
+s5 = fake_sentinel(recent_days=30, check_interval=300)
+s5.state = {"10001/busy": {"time": "2026-10-12T10:00:00", "mtime": "", "cc": 1}}
+s5.latest_page = lambda gid, count=None: [
+    {"topic_id": "other", "create_time": "2026-10-10T10:00:00", "comments_count": 1}]
 
 
 class FakeCliBusy:
@@ -240,22 +279,9 @@ class FakeCliBusy:
 
 
 s5.cli = FakeCliBusy()
-s5.notified = []
-s5.notify = lambda title, text="": s5.notified.append(title)
-s5.save_state = lambda: None
-s5._auth_fail_ts = s5._last_auth_ok = 0.0
-s5._auth_dirty = False
-for n in ("recent_keys", "check_topics", "on_missing", "auth_ok"):
-    setattr(s5, n, getattr(w.Sentinel, n).__get__(s5))
-s5.topic_link = w.Sentinel.topic_link
-s5.check_topics()
-check("限流/5xx 不当场判定删除",
-      not s5.state["10001/eee"].get("deleted")
-      and s5.state["10001/eee"].get("gone_seen"))
-s5.on_missing("10001", "eee", "10001/eee",
-              {"succeeded": False, "error": "HTTP 403"}, 150, force_confirm=True)
-check("异常响应即使走到确认点也不判删除",
-      not s5.state["10001/eee"].get("deleted"))
+s5.poll_group("10001")
+check("限流/5xx 不判定删除",
+      not s5.state["10001/busy"].get("deleted") and not any("删除" in t for t in s5.notified))
 
 # 8 凭证自检缓存: 缓存期内不重复问 whoami, 请求失败或过期才真查
 class CntCli:
@@ -285,24 +311,25 @@ s3.cli.whoami = lambda: {}
 check("凭证真失效时返回 False", s3.auth_ok(force=True) is False)
 
 # 9 凭证失效时不要把话题误判成被删除
-s4 = FakeSentinel()
-s4.out = os.path.join(TMP, "deadcred")
-os.makedirs(s4.out, exist_ok=True)
-s4.gnames = {"10001": "星球甲"}
-s4.cfg = {"check_archived": True, "recent_days": 7, "check_interval": 600,
-          "check_batch": 10, "verify_gap": 0, "confirm_gap": 150, "auth_cache_ttl": 0}
-s4.state = {"10001/ddd": {"time": fresh}}
-s4.cli = FakeCli()
-s4.cli.whoami = lambda: {}
-s4.notified = []
-s4.notify = lambda title, text="": s4.notified.append(title)
-s4.save_state = lambda: None
-s4._auth_fail_ts = s4._last_auth_ok = 0.0
-s4._auth_dirty = False
-for n in ("recent_keys", "check_topics", "on_missing", "auth_ok"):
-    setattr(s4, n, getattr(w.Sentinel, n).__get__(s4))
-s4.topic_link = w.Sentinel.topic_link
-s4.check_topics()
+s4 = fake_sentinel(recent_days=30, check_interval=300, auth_cache_ttl=0)
+s4.state = {"10001/ddd": {"time": "2026-10-12T10:00:00", "mtime": "", "cc": 1}}
+s4.latest_page = lambda gid, count=None: [
+    {"topic_id": "other", "create_time": "2026-10-10T10:00:00", "comments_count": 1}]
+
+
+class FakeCliDead:
+    def req(self, path, retries=3):
+        return {"succeeded": False, "error": "HTTP 401"}
+
+    def comments(self, tid, limit=0):
+        return []
+
+    def whoami(self):
+        return {}
+
+
+s4.cli = FakeCliDead()
+s4.poll_group("10001")
 check("凭证失效时不判定删除", not s4.state["10001/ddd"].get("deleted"))
 check("只发凭证失效告警, 不发删除告警",
       any("凭证" in t for t in s4.notified) and not any("删除" in t for t in s4.notified))

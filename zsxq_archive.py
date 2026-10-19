@@ -150,8 +150,9 @@ class Client:
             if not end:
                 return
 
-    def comments(self, tid):
-        """评论翻页: 必须用 begin_time 游标 (page= 参数无效)。"""
+    def comments(self, tid, limit=0):
+        """评论翻页: 必须用 begin_time 游标 (page= 参数无效)。
+        limit > 0 时只取前 limit 条, 用来限制单话题的请求量。"""
         out, seen, cursor = [], set(), None
         while True:
             q = "count=%d&sort=asc" % COMMENT_PAGE
@@ -165,6 +166,8 @@ class Client:
             for c in fresh:
                 seen.add(c.get("comment_id"))
                 out.append(c)
+            if limit and len(out) >= limit:
+                return out[:limit]
             if not cs or not fresh:
                 break
             nxt = cs[-1].get("create_time")
