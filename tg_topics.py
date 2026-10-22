@@ -24,6 +24,26 @@ REV_LINE_MAX = 120   # 对比里一行最多显示多少字
 REV_TTL = 15         # 修订快照目录的缓存秒数
 
 
+def snap(state):
+    """跨线程读哨兵那个 state 前先拷一份。
+    dict(...) 在 C 层一次做完, 不会因为另一个线程增删键而抛
+    "dictionary changed size during iteration"; 直接遍历会。"""
+    try:
+        return dict(state or {})
+    except Exception:
+        return {}
+
+
+def snap_list(dq):
+    """deque 也怕边遍历边追加, 拷不出来就重试两次再认命。"""
+    for _ in range(3):
+        try:
+            return list(dq or [])
+        except RuntimeError:
+            time.sleep(0.001)
+    return []
+
+
 def _ids(top_level):
     """{comment_id: (评论, 父评论或 None)} —— 顶层评论和楼中楼回复都在里面。"""
     idx = {}
@@ -132,6 +152,10 @@ class Archive:
             self._revs[gid] = (time.time(), table)
         return sorted(table.get(str(tid), []))
 
+    def forget_revs(self, gid):
+        """快照文件被清掉之后调用: 下次读重新扫目录, 别拿旧列表点进已经不在的文件。"""
+        self._revs.pop(str(gid), None)
+
     def rev_count(self, gid, tid, rec=None):
         n = (rec or {}).get("revs")
         return int(n) if n is not None else len(self.rev_numbers(gid, tid))
@@ -139,22 +163,31 @@ class Archive:
     # ---------- 清单与标题 ----------
 
     def title(self, gid, tid, rec=None):
-        """话题标题: state 里记了就用, 没记就翻 raw (结果留在内存里)。"""
+        """话题标题: state 里记了就用, 没记就翻 raw (结果留在内存里)。
+        只缓存真标题: 「(无标题)」多半是当时 raw 还没落盘, 缓存住就再也刷不新了。"""
         tid = str(tid)
-        if tid not in self._titles:
-            t = ((rec or {}).get("title") or "").strip()
-            if not t:
-                t = (topic_title((self.load(gid, tid) or {}).get("topic") or {}) or "").strip()
-            self._titles[tid] = t or "(无标题)"
-        return self._titles[tid]
+        t = self._titles.get(tid)
+        if t:
+            return t
+        t = ((rec or {}).get("title") or "").strip()
+        if not t:
+            t = (topic_title((self.load(gid, tid) or {}).get("topic") or {}) or "").strip()
+        if not t:
+            return "(无标题)"
+        if len(self._titles) > 5000:      # 别让它无限长
+            self._titles.clear()
+        self._titles[tid] = t
+        return t
 
     def forget_title(self, tid):
         self._titles.pop(str(tid), None)
 
     def entries(self, state, gid=None):
-        """备份清单, 按时间从新到旧。只读 state, 不碰文件。"""
+        """备份清单, 按时间从新到旧。只读 state, 不碰文件。
+        先拷一份: 机器人线程读的时候, 哨兵线程正在增删键, 直接遍历会抛
+        "dictionary changed size during iteration", 表现就是点一下没反应。"""
         out = []
-        for key, rec in (state or {}).items():
+        for key, rec in snap(state).items():
             if not isinstance(rec, dict) or "/" not in key:
                 continue
             g, tid = key.split("/", 1)

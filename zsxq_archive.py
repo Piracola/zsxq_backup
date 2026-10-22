@@ -23,7 +23,7 @@ zsxq_archive.py — 知识星球「已购内容」完整归档工具 (v2)
   python zsxq_archive.py --group 12345678901234
   python zsxq_archive.py --render-only          # 只重渲染, 不联网
 """
-import argparse, hashlib, json, os, re, sys, time, uuid
+import argparse, hashlib, json, os, re, sys, tempfile, threading, time, uuid
 import urllib.request, urllib.error, urllib.parse
 
 API = "https://api.zsxq.com"
@@ -36,16 +36,47 @@ def log(m):
     print(m, flush=True)
 
 
+SAVE_LOCK = threading.Lock()      # 哨兵线程和机器人线程都会写 state.json
+
+
 def save_json(path, obj, indent=None):
     """原子落盘: 先写同目录临时文件再 replace。
-    读的人(机器人和哨兵不在一个线程里)永远不会碰到半截 JSON。"""
+    读的人(机器人和哨兵不在一个线程里)永远不会碰到半截 JSON。
+    临时文件名必须每次唯一 —— 两边撞同一个名字时, Windows 上 replace 会 PermissionError,
+    Linux 上先写的那个句柄会继续往已经被改名的文件里写, 拼出两段 JSON。"""
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=indent)
-    os.replace(tmp, path)
+    with SAVE_LOCK:
+        fd, tmp = tempfile.mkstemp(dir=d or ".", prefix=".tmp-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=indent)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def load_json(path, default=None):
+    """读 JSON; 文件坏了(断电、残写)就改名 .bad 留证, 返回 default 而不是让整个程序起不来。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        bad = path + ".bad"
+        try:
+            os.replace(path, bad)
+        except OSError:
+            pass
+        log("[!] %s 读不出来 (%s), 已改名成 %s, 这次从空的开始" %
+            (os.path.basename(path), e, os.path.basename(bad)))
+        return default
 
 
 def safe_name(s, maxlen=60):
@@ -100,12 +131,16 @@ class Client:
     def __init__(self, token, aduid=None, sleep=1.0, timeout=30):
         self.token, self.aduid, self.sleep, self.timeout = token, aduid, sleep, timeout
         self._last, self.calls = 0.0, 0
+        # 机器人在另一个线程里点按钮时会用同一个 Client 发请求, 不加锁两边会同时出去,
+        # 间隔就比 api_sleep 短, 结果是被限流
+        self._lock = threading.Lock()
 
     def _throttle(self):
-        gap = time.time() - self._last
-        if gap < self.sleep:
-            time.sleep(self.sleep - gap)
-        self._last = time.time()
+        with self._lock:
+            gap = time.time() - self._last
+            if gap < self.sleep:
+                time.sleep(self.sleep - gap)
+            self._last = time.time()
 
     def req(self, path, retries=3):
         url = path if path.startswith("http") else API + path
@@ -185,13 +220,19 @@ class Client:
         """评论翻页: 必须用 begin_time 游标 (page= 参数无效)。
         begin 给了就从这个时间往后取 (补新评论用); limit > 0 时只取这么多条。
         with_sticky=true: 不带这个参数, 星主置顶的那条评论不会出现在结果里。"""
-        out, seen, cursor = [], set(), begin or None
+        return self.comments_full(tid, limit=limit, begin=begin)[0]
+
+    def comments_full(self, tid, limit=0, begin=None):
+        """同上, 但多回一个「拉全了没有」。中途哪一页没成功就返回 False ——
+        拿半截结果去跟本地比, 会把没拉到的评论全算成「被删了」。"""
+        out, seen, cursor, ok = [], set(), begin or None, True
         while True:
             q = "count=%d&sort=asc&with_sticky=true" % COMMENT_PAGE
             if cursor:
                 q += "&begin_time=" + urllib.parse.quote(cursor)
             d = self.req("/v2/topics/%s/comments?%s" % (tid, q))
             if not d.get("succeeded"):
+                ok = False
                 break
             cs = ((d.get("resp_data") or {}).get("comments")) or []
             fresh = [c for c in cs if c.get("comment_id") not in seen]
@@ -199,14 +240,14 @@ class Client:
                 seen.add(c.get("comment_id"))
                 out.append(c)
             if limit and len(out) >= limit:
-                return out[:limit]
+                return out[:limit], True
             if not cs or not fresh:
                 break
             nxt = cs[-1].get("create_time")
             if not nxt or nxt == cursor:
                 break
             cursor = nxt
-        return out
+        return out, ok
 
 
 def download(url, dest):

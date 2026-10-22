@@ -11,8 +11,9 @@ zsxq_watch.py — 知识星球云端哨兵
       - 内容被编辑 → 修订版另存 raw/gid/tid__rev_N.json, 发告警 + 逐行差异
       - 评论数变化 → 拉一次评论, 跟本地基线比出新增/消失的那几条, 连同是谁说的
                      一起告警 (comment_alert 分四档: 都提醒 / 只看新增 / 只看减少 / 全关)
-  * 评论抽查: 每轮顺手把一个话题的评论区整段翻一遍 (默认 1 条), 兜住那个计数看不见的
-    变化 —— 楼中楼被删 (平台数字常常不跟着减)、一轮之内涨了又跌回原数、增量拉漏的回复。
+  * 评论抽查: 每隔一段时间 (默认半小时) 开一批, 一批翻 20 条话题的评论区 (先挑最久没核过的),
+    兜住那个计数看不见的变化 —— 楼中楼被删 (平台数字常常不跟着减)、一轮之内涨了又跌回
+    原数、增量拉漏的回复。一批会摊在接下来的几次轮询里, 不会一口气发一串请求。
     注意 comments_count 数的是「主评论 + 楼中楼」, 有人回复楼中楼数字是会动的。
   * 抓取节奏逐个星球可调: 间隔、每轮页数、复查周期与窗口、评论上限、是否下图、
     夜间静默、评论提醒档位、评论抽查密度。Telegram 机器人的「抓取设置」里点按钮就能改。
@@ -28,7 +29,7 @@ zsxq_watch.py — 知识星球云端哨兵
 import argparse, json, os, random, sys, time, urllib.parse, urllib.request
 from collections import deque
 from zsxq_archive import (Client, download, collect_images, collect_files,
-                          render_md, topic_filename, safe_name, save_json,
+                          render_md, topic_filename, safe_name, save_json, load_json,
                           topic_gone, topic_title, log)
 from tg_topics import Archive
 from tg_bot import TgBot
@@ -43,8 +44,8 @@ DEFAULT_CFG = {
     "check_batch": 10,         # 每轮最多确认几条, 免得一次性扎堆
     "recent_days": 3,          # 确认范围上限: 只确认最近 N 天的话题
     "max_comments": 0,         # 每个话题最多抓多少条评论; 0 = 全部
-    "sweep_interval": 1800,    # 评论抽查: 同一话题两次整段翻评论区的最小间隔 (秒); 0 = 不抽查
-    "sweep_batch": 1,          # 每轮最多抽查几条话题的评论区
+    "sweep_every": 1800,       # 评论抽查: 每隔多少秒把最近一批话题的评论区整段翻一遍; 0 = 不抽查
+    "sweep_size": 20,          # 每一批翻几条 (最近发布的优先)
     "keep_media": True,        # 是否下载图片与附件; False 只留 raw JSON 里的远程链接
     "comment_alert": "both",   # 评论提醒: both 都报 / added 只报新增 / removed 只报减少 / off 全关
     "quiet_hours": [0, 0],     # 夜间静默 [起, 止] 本地小时, 支持跨零点 [22,6]; 起=止 表示不静默
@@ -104,6 +105,16 @@ def load_cfg(path, cli_groups):
                     log("[·] notify_comments 换成四档的 comment_alert 了 "
                         "(both/added/removed/off), 这次按 %s 算" % old)
             cfg["comment_alert"] = _alert_mode(cfg.get("comment_alert"))
+            # 抽查从「每个话题各自计时」改成「定时翻最近一批」:
+            # 老的 sweep_interval 是秒, 直接接过来当批次间隔; 每轮条数那个键不要了
+            if "sweep_interval" in cfg:
+                old = cfg.pop("sweep_interval")
+                if "sweep_every" not in user:
+                    cfg["sweep_every"] = old
+                    log("[·] sweep_interval 改叫 sweep_every 了 (每隔多少秒翻一批评论)")
+            if "sweep_batch" in cfg:
+                cfg.pop("sweep_batch")
+                log("[·] sweep_batch 已停用: 现在按「最近 sweep_size 条」成批翻, 不用它了")
             for o in (cfg.get("group_opts") or {}).values():
                 if not isinstance(o, dict):
                     continue
@@ -111,6 +122,9 @@ def load_cfg(path, cli_groups):
                     o.setdefault("comment_alert", _alert_mode(o.pop("notify_comments")))
                 if "comment_alert" in o:
                     o["comment_alert"] = _alert_mode(o["comment_alert"])
+                if "sweep_interval" in o:
+                    o.setdefault("sweep_every", o.pop("sweep_interval"))
+                o.pop("sweep_batch", None)
             gone = [k for k in RETIRED if k in user]
             if gone:
                 log("[·] 这些配置项已停用, 可以从 watch.json 删掉: %s (检测已并入每轮抓取)" %
@@ -131,19 +145,21 @@ class Sentinel:
         self.cred_path = cred_path
         os.makedirs(out, exist_ok=True)
         self.state_path = os.path.join(out, "state.json")
-        self.state = json.load(open(self.state_path, encoding="utf-8")) if os.path.exists(self.state_path) else {}
+        self.state = load_json(self.state_path, {}) or {}
         cred = json.load(open(cred_path, encoding="utf-8"))
         self.cli = Client(cred["access_token"], cred.get("aduid"),
                           sleep=max(0.2, cfg.get("api_sleep", 1.0)))
         self.archive = Archive(out)       # 备份目录的视图, 机器人也用这个
         self.events = deque(maxlen=200)   # 最近变动 (只在内存里, 机器人「最近变动」页读它)
         self.last_poll = {}               # gid -> 上次成功看过列表的时间
+        self._sweep = {}                  # gid -> {"queue": [...], "next_at": 时间戳} 评论抽查的进度
         self.gnames = {}          # gid -> 名称
         self._groups_at = 0.0     # 上次拉星球名单的时间
         self._auth_fail_ts = 0.0  # 凭证告警冷却
         self._last_auth_ok = 0.0  # 最近一次凭证校验通过的时间
         self._auth_dirty = False  # 有请求失败 → 下一轮强制重验凭证, 不吃缓存
         self._last_prune = 0.0    # 限量清理不必每轮都做
+        self._index_dirty = False  # 删除/编辑发生过, 轮末要重建 index.md
         self.bot = None           # Telegram 机器人线程 (main 里启动)
 
     # ---------- 基础 ----------
@@ -407,46 +423,68 @@ class Sentinel:
                             "星球: %s\n标题: %s\n%s" % (
                                 gname, (topic.get("title") or "")[:60],
                                 self.topic_link(gid, tid)))
-        if self.sweep_comments(gid):   # 顺手翻一两条评论区, 补上评论数看不出的变化
+        if self.sweep_comments(gid):   # 顺手翻一条评论区, 补上评论数看不出的变化
             dirty = True
         if dirty:                      # 基线变了才落盘, 别每轮都重写 state.json
             self.save_state()
         self.check_window(gid, page, seen)
 
     def sweep_comments(self, gid):
-        """轮着把评论区整段翻一遍。评论数这个数字看不见的三件事全靠它:
-        楼中楼里有人回复、有人删楼中楼, 以及一轮之内涨了又跌回原数。
-        每轮最多翻 sweep_batch 条, 同一话题两次之间至少隔 sweep_interval。"""
-        every = int(self.opt(gid, "sweep_interval") or 0)
-        batch = int(self.opt(gid, "sweep_batch") or 0)
-        if every <= 0 or batch <= 0 or self.opt(gid, "comment_alert") == "off":
+        """评论抽查: 每隔 sweep_every 秒开一批, 翻 sweep_size 条话题的评论区
+        (先挑最久没核过的, 窗口里的话题迟早都轮到)。一批不是一口气发完 ——
+        每次轮询只翻一条, 摊在接下来的几次轮询里, 免得一秒钟攒出一串请求。"""
+        every = int(self.opt(gid, "sweep_every") or 0)
+        size = int(self.opt(gid, "sweep_size") or 0)
+        if every <= 0 or size <= 0 or self.opt(gid, "comment_alert") == "off":
             return False
+        st = self._sweep.setdefault(str(gid), {"queue": [], "next_at": 0.0})
         now = time.time()
+        if not st["queue"]:
+            if now < st["next_at"]:
+                return False
+            st["queue"] = self._sweep_pick(gid, size)
+            if not st["queue"]:
+                return False                  # 这一刻没得翻就不推进 next_at, 下一轮再看一眼
+            st["next_at"] = now + every       # 下一批最早什么时候开: 至少隔 every 秒
+            log("    [·] 评论抽查: 这批有 %d 条要翻" % len(st["queue"]))
+        key = st["queue"].pop(0)
+        v = self.state.get(key)
+        if not v:                             # 排队期间被「保留条数」清掉了
+            return True
+        tid = key.split("/", 1)[1]
+        v["swept"] = now                      # 记一笔「最近完整翻过」, 失败也记, 免得下批又撞上
+        try:
+            self.sweep_one(gid, tid, key)
+        except Exception as e:
+            log("[!] 评论抽查出错 %s: %s" % (tid, str(e)[:120]))
+        return True
+
+    def _sweep_pick(self, gid, size):
+        """这一批翻哪几条。窗口里有评论、还在的话题, 先挑最久没核过的, 同样久就挑新的。
+        只按「最近的 N 条」挑的话, 窗口里第 N+1 条起永远轮不到, 而删除最容易发生在
+        过了几天的话题上, 所以按上次翻过的时间排队。"""
         days = int(self.opt(gid, "recent_days") or 0)
-        cand = []
+        now = time.time()
+        rows = []
         for key, v in self.state.items():
             if not key.startswith(gid + "/") or v.get("deleted"):
                 continue
             if not (v.get("cc") or 0):
-                continue                  # 没评论的话题不用翻; 一旦有人评论, 数量那条路会管
+                continue                      # 没评论的话题翻不出东西, 省一个请求
             ct = v.get("time") or ""
-            if days and ct and _ts(ct) < now - days * 86400:
+            if not ct or (days and _ts(ct) < now - days * 86400):
                 continue
-            last = float(v.get("swept") or 0)
-            if now - last < every:
-                continue
-            cand.append((last, key))
-        if not cand:
-            return False
-        cand.sort()                       # 最久没翻过的先翻
-        for _, key in cand[:batch]:
-            tid = key.split("/", 1)[1]
-            self.state[key]["swept"] = now    # 翻了就记下 (失败也记, 免得同一话题连着几轮硬撞)
-            try:
-                self.sweep_one(gid, tid, key)
-            except Exception as e:
-                log("[!] 评论抽查出错 %s: %s" % (tid, str(e)[:120]))
-        return True
+            rows.append((float(v.get("swept") or 0), -_ts(ct), key))
+        rows.sort()
+        return [k for _, _, k in rows[:size]]
+
+    def _fetch_comments(self, tid, limit=0, begin=None):
+        """拉评论, 顺带要知道「拉全了没有」。中途有一页失败时不能拿结果去断言谁不见了。
+        测试里的假客户端只有 comments(), 那种情况按「拉全了」算。"""
+        full = getattr(self.cli, "comments_full", None)
+        if full:
+            return full(tid, limit=limit, begin=begin)
+        return self.cli.comments(tid, limit=limit, begin=begin), True
 
     def sweep_one(self, gid, tid, key):
         """整段拉一遍评论区跟本地比。比对和推送都复用评论变动那一套, 只是触发原因不同。"""
@@ -456,16 +494,16 @@ class Sentinel:
         v = self.state[key]
         stored = Archive.comments_of(raw)
         limit = int(self.opt(gid, "max_comments") or 0)
-        fetched = self.cli.comments(tid, limit=limit)
+        fetched, ok = self._fetch_comments(tid, limit=limit)
         if not fetched:
             return
         cc_old = int(v.get("cc") or 0)
         # 口径要跟接口一致: comments_count 是「主评论 + 楼中楼」的总条数
         got = Archive.comment_total(fetched)
-        complete = (not limit) or got >= cc_old
+        complete = ok and ((not limit) or got >= cc_old)
         added, gone = Archive.diff_comments(stored, fetched)
         if not complete:
-            gone = []                     # 没拉全, 不能说谁不见了
+            gone = []                     # 没拉全 (或没拉到头), 不能说谁不见了
         if not added and not gone:
             log("    [·] 抽查评论区: %s 没有变化" % tid)
             return
@@ -530,8 +568,13 @@ class Sentinel:
         auth_checked = False
         for key in cand[:budget]:
             tid = key.split("/", 1)[1]
-            self.state[key]["last_check"] = now      # 查过就记下, 下轮不重复问
             d = self.cli.req("/v2/topics/%s" % tid)
+            if d.get("succeeded") or topic_gone(d):
+                # 有了明确结论才按整个间隔记; 网络抖动不该把这条话题的确认推迟一整个间隔
+                self.state[key]["last_check"] = now
+            else:
+                # 但也不能每轮都来撞同一个, 60 秒后再试就够了
+                self.state[key]["last_check"] = now - max(0, interval - 60)
             if d.get("succeeded"):
                 self.on_detail(gid, tid, key,
                                (d.get("resp_data") or {}).get("topic") or {})
@@ -559,6 +602,7 @@ class Sentinel:
         """窗口内缺席, 单独确认时接口明确报不存在 → 定性为删除。"""
         tid = key.split("/", 1)[1]
         v = self.state[key]
+        self._index_dirty = True
         title = v.get("title") or ""
         rec = {"topic_id": tid, "group_id": gid, "group": self.gnames.get(gid, gid),
                "title": title, "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -672,18 +716,18 @@ class Sentinel:
         complete = True
         if new_cc > old_cc and stored:
             begin = max((c.get("create_time") or "") for c in stored) or None
-            fetched = self.cli.comments(tid, limit=0, begin=begin)
+            fetched, ok = self._fetch_comments(tid, limit=0, begin=begin)
             added, _tail = Archive.diff_comments(stored, fetched)
             gone = []                             # 只拉到尾巴, 老评论不在里面很正常
             if not fetched:                       # 游标什么都没给回来: 整段拉一次兜底
-                fetched = self.cli.comments(tid, limit=limit)
+                fetched, ok = self._fetch_comments(tid, limit=limit)
                 added, gone = Archive.diff_comments(stored, fetched)
-                complete = (not limit) or Archive.comment_total(fetched) >= new_cc
+                complete = ok and ((not limit) or Archive.comment_total(fetched) >= new_cc)
         else:
-            fetched = self.cli.comments(tid, limit=limit)
+            fetched, ok = self._fetch_comments(tid, limit=limit)
             added, gone = Archive.diff_comments(stored, fetched)
             # 只取了前 limit 条就没法断言「谁不见了」, 也别谎报比全了
-            complete = (not limit) or Archive.comment_total(fetched) >= new_cc
+            complete = ok and ((not limit) or Archive.comment_total(fetched) >= new_cc)
         if not complete:
             gone = []
         if fetched:
@@ -693,6 +737,7 @@ class Sentinel:
     def on_edited(self, gid, tid, key, topic, old_cc, new_cc):
         """话题被编辑: 存一份修订快照, 算好逐行差异再告警。"""
         gname = self.gnames.get(gid, gid)
+        self._index_dirty = True
         # 列表里的正文可能被服务端截断, 这里单独拉一次全量
         d = self.cli.req("/v2/topics/%s" % tid)
         snap = ((d.get("resp_data") or {}).get("topic") or {}) if d.get("succeeded") else {}
@@ -769,8 +814,10 @@ class Sentinel:
             except Exception as e:
                 log("[!] %s 抓取异常: %r" % (g, e))
         gained = len(self.state) - before
-        if gained > 0:
+        # 删除和编辑也要让 index.md 跟上, 不然 🚫/✏️ 标记要等下一个新话题才出现
+        if gained > 0 or self._index_dirty:
             self.rebuild_index()
+            self._index_dirty = False
         self.prune_all()
         if gained > 0:                    # 没新内容就不刷日志, 间隔调到十几秒也不吵
             log("[·] %s 新增备份 %d, 状态共 %d 条" % (
@@ -818,13 +865,17 @@ class Sentinel:
     def describe(self, gid, with_name=True):
         """把某个星球的实际节奏写成一行, 启动日志 / /status / 星球页都用它。"""
         def fmt(sec):
-            if sec < 60:
-                return "%.0f 秒" % sec
-            if sec < 3600:
-                return "%.0f 分钟" % (sec / 60.0)
-            return "%.0f 小时" % (sec / 3600.0)
+            n = int(sec)
+            if n < 60:
+                return "%d 秒" % n
+            if n < 3600:
+                m, s = divmod(n, 60)
+                return ("%d 分钟" % m) if not s else ("%d 分 %d 秒" % (m, s))
+            h, rest = divmod(n, 3600)
+            m = rest // 60
+            return ("%d 小时" % h) if not m else ("%d 小时 %d 分" % (h, m))
         ci = int(self.opt(gid, "check_interval") or 0)
-        sw = int(self.opt(gid, "sweep_interval") or 0)
+        sw = int(self.opt(gid, "sweep_every") or 0)
         qs, qe = (list(self.opt(gid, "quiet_hours") or [0, 0]) + [0, 0])[:2]
         body = "每 %s 抓一次 · %d 条/轮 · 删除复查 %s · 评论 %s · %s%s%s" % (
             fmt(float(self.opt(gid, "poll_interval") or 30)),
@@ -833,7 +884,8 @@ class Sentinel:
             ("全部" if not int(self.opt(gid, "max_comments") or 0)
              else "%d 条" % int(self.opt(gid, "max_comments"))),
             ("下图" if self.opt(gid, "keep_media") else "不下图"),
-            ("" if sw <= 0 else " · 抽查 每 " + fmt(float(sw))),
+            ("" if sw <= 0 else " · 抽查 %d 条/批 每 %s" % (
+                int(self.opt(gid, "sweep_size") or 20), fmt(float(sw)))),
             ("" if qs == qe else " · %d-%d 点静默" % (qs, qe)))
         return ("%s: %s" % (self.gnames.get(str(gid), str(gid)), body)) if with_name else body
 

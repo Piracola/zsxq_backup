@@ -27,6 +27,10 @@
   19 全文页: 区块分开 / 图与附件 / 原文链接
   20 搜索: 按标题找得到, 找不到说得清
   21 归档时把标题记进 state
+  22 评论提醒四档 + 评论抽查 (批次挑选 / 半截数据不谎报)
+  23 设置页手填数值 (单位换算 / 范围 / 过期 / 取消)
+  24 老配置升级 (notify_comments、sweep_interval)
+  25 落盘: 两线程同写不写坏 / 坏 JSON 不炸
 """
 import asyncio
 import json
@@ -34,6 +38,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -83,10 +88,12 @@ def fake_sentinel(**cfg):
     s.save_state = lambda: None
     s.events = deque(maxlen=200)
     s.last_poll = {}
+    s._sweep = {}            # 评论抽查的批次进度
     s.archive = tg_topics.Archive(s.out)
     s._auth_fail_ts = s._last_auth_ok = 0.0
     s._auth_dirty = False
     s._last_prune = 0.0
+    s._index_dirty = False
     s.bot = None
     s.archive_topic = lambda gid, gname, topic: s.state.__setitem__(
         "%s/%s" % (gid, topic.get("topic_id")),
@@ -95,7 +102,7 @@ def fake_sentinel(**cfg):
          "title": za.topic_title({"title": topic.get("title") or ""})})
     for n in ("opt", "set_opt", "in_quiet", "latest_page", "poll_group", "check_window",
               "on_detail", "on_comment_change", "comment_delta", "on_edited", "on_deleted",
-              "sweep_comments", "sweep_one",
+              "sweep_comments", "sweep_one", "_sweep_pick", "_fetch_comments",
               "auth_ok", "describe", "autopush_on", "add_event"):
         setattr(s, n, getattr(w.Sentinel, n).__get__(s))
     s.topic_link = w.Sentinel.topic_link       # staticmethod, 不要绑到实例上
@@ -647,7 +654,7 @@ def sweep_sentinel(**cfg):
     return s
 
 
-sw = sweep_sentinel(recent_days=30, sweep_interval=1800, sweep_batch=1)
+sw = sweep_sentinel(recent_days=30, sweep_every=1800, sweep_size=20)
 sw.cli = ReplyCli()
 sw.sweep_comments("10001")
 check("抽查发现新到的楼中楼",
@@ -661,19 +668,19 @@ check("抽查把评论数对齐到平台口径 (含楼中楼), 下一轮不会�
       sw.state["10001/s1"]["cc"] == 4)
 ran = sw.cli.n
 sw.sweep_comments("10001")
-check("刚抽查过的话题不会连着再翻", sw.cli.n == ran)
+check("一批翻完就歇着, 不会连着再翻", sw.cli.n == ran)
 
-sa = sweep_sentinel(recent_days=30, sweep_interval=1800, comment_alert="added")
+sa = sweep_sentinel(recent_days=30, sweep_every=1800, comment_alert="added")
 sa.cli = ShrinkCli()
 sa.sweep_comments("10001")
 check("只看新增: 抽查发现变少也不打扰", not sa.bot.pushed)
 
-so = sweep_sentinel(recent_days=30, sweep_interval=1800, comment_alert="off")
+so = sweep_sentinel(recent_days=30, sweep_every=1800, comment_alert="off")
 so.cli = NoFetchCli()
 so.sweep_comments("10001")
 check("全关: 抽查一个请求都不花", so.cli.n == 0)
 
-sc = fake_sentinel(recent_days=30, sweep_interval=1800, max_comments=20)
+sc = fake_sentinel(recent_days=30, sweep_every=1800, max_comments=20)
 sc.bot = FakeBot()
 write_raw(sc, "10001", "s2", {"topic_id": "s2", "title": "很多评论的题",
                               "comments_count": 50}, old)
@@ -688,6 +695,216 @@ class ShortCli:
 sc.cli = ShortCli()
 sc.sweep_comments("10001")
 check("抽查被上限截断时什么都不说", not sc.bot.pushed)
+
+# 一批翻「几条」: 先挑最久没核过的, 同样久就挑新的, 没评论的不占位
+sm = fake_sentinel(recent_days=60, sweep_every=1800, sweep_size=2)
+sm.bot = FakeBot()
+sm.state = {}
+order = ["t3", "t1", "t4", "t2"]        # 故意打乱插入顺序, 排序坏了这条测试要响
+for tid in order:
+    n = int(tid[1:])
+    write_raw(sm, "10001", tid, {"topic_id": tid, "title": "题 %d" % n,
+                                 "comments_count": 3}, old)
+    sm.state["10001/" + tid] = {"time": "2026-10-1%dT08:00:00" % (6 - n), "cc": 3,
+                                "title": "题 %d" % n}
+sm.state["10001/t0"] = {"time": "2026-10-15T09:00:00", "cc": 0, "title": "没人评论的题"}
+sm.cli = ReplyCli()
+sm.sweep_comments("10001")
+check("一批挑最新的两条, 没评论的不占位",
+      sm._sweep["10001"]["queue"] == ["10001/t2"], str(sm._sweep["10001"]["queue"]))
+sm.sweep_comments("10001")
+check("第二条也在这一批里翻完", sm._sweep["10001"]["queue"] == [])
+check("翻的就是最新的那两条", sorted(k for k in sm.state if sm.state[k].get("swept"))
+      == ["10001/t1", "10001/t2"], str(sorted(k for k in sm.state if sm.state[k].get("swept"))))
+n2 = sm.cli.n
+sm.sweep_comments("10001")
+check("一批翻完就歇到下一批, 不再花请求", sm.cli.n == n2)
+sm._sweep["10001"]["next_at"] = 0        # 假装时间到了
+sm.sweep_comments("10001")
+check("到点了开新的一批", sm.cli.n == n2 + 1)
+
+# 只按时间挑的话, 窗口里第 N+1 条起永远轮不到, 所以先看「上次翻过没有」
+sst = fake_sentinel(recent_days=60, sweep_every=1800, sweep_size=1)
+sst.bot = FakeBot()
+sst.state = {"10001/n1": {"time": "2026-10-15T08:00:00", "cc": 3,
+                          "swept": time.time() - 300},     # 新的, 刚翻过
+             "10001/o1": {"time": "2026-10-10T08:00:00", "cc": 3}}   # 旧的, 一直没翻
+for tid in ("n1", "o1"):
+    write_raw(sst, "10001", tid, {"topic_id": tid, "title": tid, "comments_count": 3}, old)
+sst.cli = ReplyCli()
+sst.sweep_comments("10001")
+check("先挑最久没核过的, 不是最新的",
+      sst.state["10001/o1"]["swept"] > sst.state["10001/n1"]["swept"],
+      "%s vs %s" % (sst.state["10001/o1"].get("swept"), sst.state["10001/n1"].get("swept")))
+
+# 手动填数值: 说得出口的都认
+mb = new_bot(fake_sentinel())
+check("手填: 光一个数字按秒", mb.manual_value("poll_interval", "45") == (45, ""))
+check("手填: 带单位也认", mb.manual_value("poll_interval", "2分钟") == (120, ""))
+check("手填: 分钟那项按分钟算", mb.manual_value("check_interval", "45") == (2700, ""))
+check("手填: 90 秒换算成分钟也对", mb.manual_value("sweep_every", "90秒") == (90, ""))
+check("手填: 0 就是关掉", mb.manual_value("sweep_every", "0") == (0, ""))
+check("手填: 天那项按天", mb.manual_value("recent_days", "7天") == (7, ""))
+bad, why = mb.manual_value("page_size", "100")
+check("手填: 超范围会说清范围", bad is None and "5–30" in why, why)
+bad2, why2 = mb.manual_value("poll_interval", "很快")
+check("手填: 不是数字就直说", bad2 is None and "不像一个数字" in why2, why2)
+check("设置页留了手动填的入口",
+      any("手动填数值" in b.text for row in mb.kb_set("10001").inline_keyboard for b in row))
+mkeys = [b.callback_data for row in mb.kb_manual("10001").inline_keyboard for b in row]
+check("手动填的每一项都带单位", any(x == "X:10001:sweep_every" for x in mkeys), str(mkeys))
+
+
+# 手填这条路: 假的 update 走一遍真实的 handler
+class _Chat:
+    id = 7
+
+
+class _User:
+    id = 9
+
+
+class _Msg:
+    def __init__(self, text=""):
+        self.text, self.chat_id = text, 7
+
+
+class _Upd:
+    def __init__(self, text=""):
+        self.effective_chat = _Chat()
+        self.effective_user = _User()
+        self.message = _Msg(text)
+
+
+class _Q:
+    def __init__(self, data):
+        self.data, self.message, self.from_user = data, _Msg(), _User()
+
+    async def answer(self):
+        pass
+
+
+class _CUpd(_Upd):
+    def __init__(self, data):
+        _Upd.__init__(self)
+        self.callback_query = _Q(data)
+
+
+def talk_bot(**cfg):
+    b = new_bot(fake_sentinel(**cfg))
+    b._pending = {}
+    b.autopush = {}
+    b.autopush_path = os.path.join(TMP, "w_talk.json")
+    out = []
+
+    async def _send(chat_id, text, kb=None):
+        out.append(text)
+
+    async def _show(q, text, kb=None):
+        out.append(text)
+
+    b._send, b._show = _send, _show
+    return b, out
+
+
+tb, tout = talk_bot()
+asyncio.run(tb.cb_manual_pick(_CUpd("X:10001:poll_interval"), None))
+check("点一项就问你一个数", "单位是秒" in tout[-1] and tb._pending, tout[-1])
+asyncio.run(tb.cmd_search(_Upd("45"), None))
+check("发个数字就存下去", tb.s.opt("10001", "poll_interval") == 45)
+check("存完就不再等着", not tb._pending)
+check("回一句已经改了", "抓取间隔" in tout[-1] and "45" in tout[-1])
+
+tb.pending_put(7, 9, "10001", "page_size")
+asyncio.run(tb.cmd_search(_Upd("很多"), None))
+check("读不懂就再问一次, 状态留着", (7, 9) in tb._pending and "再发一次" in tout[-1])
+asyncio.run(tb.cmd_search(_Upd("30"), None))
+check("第二次就能成", tb.s.opt("10001", "page_size") == 30 and not tb._pending)
+
+tb.pending_put(7, 9, "10001", "poll_interval")
+tb._pending[(7, 9)] = ("10001", "poll_interval", time.time() - 400)   # 隔了 6 分钟
+asyncio.run(tb.cmd_search(_Upd("7"), None))
+check("隔太久就不再当成数字, 那句话回去搜索",
+      tb.s.opt("10001", "poll_interval") == 45 and "标题" in tout[-1])
+
+tb.pending_put(7, 9, "10001", "poll_interval")
+asyncio.run(tb.cmd_cancel(_Upd("/cancel"), None))
+check("/cancel 能退出来", not tb._pending and "不填了" in tout[-1])
+
+asyncio.run(tb.cb_manual_pick(_CUpd("X:10001:max_comments"), None))
+check("评论上限的 0 是全部, 别说成关掉", "全抓" in tout[-1] and "关掉" not in tout[-1], tout[-1])
+asyncio.run(tb.cb_manual_pick(_CUpd("X:10001:sweep_every"), None))
+check("抽查的 0 才是关掉", "填 0 就是关掉" in tout[-1], tout[-1])
+check("nan/inf 不当数字", tb.manual_value("poll_interval", "nan")[0] is None
+      and tb.manual_value("poll_interval", "1e999")[0] is None)
+
+# ---------- 13e 落盘与半截数据 ----------
+# 两个线程同时写 state.json: 临时文件必须每次唯一, 否则会写出半截 / 两段拼起来的 JSON
+def _hammer(path, n, tag):
+    for i in range(n):
+        za.save_json(path, {"tag": tag, "i": i, "pad": "x" * 4000})
+
+
+hpath = os.path.join(TMP, "hammer.json")
+ths = [threading.Thread(target=_hammer, args=(hpath, 20, t)) for t in ("a", "b")]
+for t_ in ths:
+    t_.start()
+for t_ in ths:
+    t_.join()
+check("两个线程写同一个文件也不会写坏", isinstance(za.load_json(hpath, None), dict))
+
+badp = os.path.join(TMP, "bad.json")
+with open(badp, "w", encoding="utf-8") as f:
+    f.write('{"half": ')
+check("坏掉的 JSON 不会让程序起不来, 会留个 .bad",
+      za.load_json(badp, {}) == {} and os.path.exists(badp + ".bad"))
+
+
+class HalfCli:
+    """翻到一半请求失败: 只给了前两条, 但剩下的不能算「被删了」。"""
+    def comments(self, tid, limit=0, begin=None):
+        return old[:2]
+
+    def comments_full(self, tid, limit=0, begin=None):
+        return old[:2], False
+
+
+sh = fake_sentinel(recent_days=30, sweep_every=1800, sweep_size=20)
+sh.bot = FakeBot()
+write_raw(sh, "10001", "h1", {"topic_id": "h1", "title": "评论挺多的题",
+                              "comments_count": 3}, old)
+sh.state = {"10001/h1": {"time": "2026-10-15T08:00:00", "cc": 3, "title": "评论挺多的题"}}
+sh.cli = HalfCli()
+sh.sweep_comments("10001")
+check("只拉到一半时不说评论被删", not sh.bot.pushed)
+check("只拉到一半时也不把评论数改小", sh.state["10001/h1"]["cc"] == 3)
+
+# 标题缓存不能把「(无标题)」记死, 不然 raw 后来落盘了也刷不出来
+s_t = fake_sentinel()
+arch_t = tg_topics.Archive(s_t.out)
+first = arch_t.title("10001", "later", {})
+write_raw(s_t, "10001", "later", {"topic_id": "later", "title": "后来的题"})
+check("标题缓存不会把「(无标题)」记死",
+      first == "(无标题)" and arch_t.title("10001", "later", {}) == "后来的题", first)
+
+
+class _PickyBot:
+    """HTML 一律拒收, 退回纯文本才收 —— 模拟星球名里带 & 被 Telegram 拒的那次。"""
+    def __init__(self):
+        self.got = []
+
+    async def send_message(self, chat, text, parse_mode=None, **kw):
+        if parse_mode:
+            raise telegram.error.BadRequest("can't parse entities")
+        self.got.append(text)
+
+
+pb = new_bot(fake_sentinel())
+pb.app = type("App", (), {"bot": _PickyBot()})()
+asyncio.run(pb._send(7, "「AI &amp; 投资」<b>加粗</b>"))
+check("HTML 被拒时退回纯文本重发",
+      bool(pb.app.bot.got) and "<b>" not in pb.app.bot.got[-1] and "AI & 投资" in pb.app.bot.got[-1],
+      pb.app.bot.got[-1] if pb.app.bot.got else "什么都没发")
 
 # ---------- 13d 楼中楼也算进 comments_count ----------
 # 拿 4745 条真实存档核过: 接口的 comments_count = 主评论 + 楼中楼, 差额只来自删除
@@ -829,19 +1046,24 @@ check("存档丢了也能从这里捞回来", "存档文件不在了" in text
 
 # ---------- 17 评论页 ----------
 s19 = fake_sentinel()
-many = [comment(i, "用户%d" % i, "评论内容%d" % i, "2026-10-15T09:%02d:00" % i,
-                replies=[comment(100 + i, "回复者%d" % i, "子回复%d" % i)]
+long_text = "这一条写得很长，" * 90          # 一条就一千多字, 一页放不下几条
+many = [comment(i, "用户%d" % i, long_text + "#%d" % i, "2026-10-15T09:%02d:00" % i,
+                replies=[comment(100 + i, "回复者%d" % i, "子回复%d" % i + long_text)]
                 if i == 1 else None)
         for i in range(1, 8)]
 write_raw(s19, "10001", "c1", {"topic_id": "c1", "title": "评论很多的题"}, many)
 s19.state = {"10001/c1": {"time": "2026-10-15T08:00:00", "cc": 7, "title": "评论很多的题"}}
 b19 = new_bot(s19)
 text, kb = b19._comments_view("10001", "c1", 1)
-check("评论页分页", "第 1/2 页" in text and len(many) == 7)
+check("评论页按长度分页, 不会把一页撑爆", "第 1/" in text and tg_bot._u16(text) <= tg_bot.MAXLEN,
+      str(tg_bot._u16(text)))
 check("评论页显示楼中楼", "回复者1" in text and "回复" in text)
 check("评论页有翻页和拉最新", {"C:10001:c1:2", "Z:10001:c1", "T:10001:c1:L:1"} <= set(callbacks(kb)))
 text2, _ = b19._comments_view("10001", "c1", 0)
-check("第 0 页就是最后一页", "第 2/2 页" in text2)
+check("第 0 页就是最后一页", "第 " in text2 and "/2 页" in text2, text2[:40])
+joined = "".join(b19._comments_view("10001", "c1", p)[0] for p in range(1, 5))
+check("翻完一遍一条评论都不少",
+      all("#%d" % i in joined for i in range(1, 8)) and tg_bot._u16(text2) <= tg_bot.MAXLEN)
 
 # 从服务器补评论 (async)
 s20 = fake_sentinel()
@@ -928,7 +1150,7 @@ s24.archive_topic("10001", "星球甲",
 check("归档时记下标题", s24.state["10001/n1"]["title"] == "新归档的标题")
 check("state 里也记了评论数和修改时间",
       "cc" in s24.state["10001/n1"] and "mtime" in s24.state["10001/n1"])
-check("刚归档的话题不会立刻被抽查", s24.state["10001/n1"].get("swept"))
+check("归档时记下「刚翻过」的时间, 抽查会把它排到队尾", s24.state["10001/n1"].get("swept"))
 
 # ---------- 22 生成的 HTML 必须能被 Telegram 接受 ----------
 s25 = fake_sentinel()
@@ -968,6 +1190,17 @@ check("星球里老的 true 换成「都提醒」",
       cfg["group_opts"]["10001"].get("comment_alert") == "both"
       and "notify_comments" not in cfg["group_opts"]["10001"])
 check("老键不再留在运行时配置里", "notify_comments" not in cfg)
+
+# 抽查从「每个话题各自计时」改成「定时翻最近一批」, 老键要接过来
+legacy2 = os.path.join(TMP, "legacy2.json")
+with open(legacy2, "w", encoding="utf-8") as f:
+    json.dump({"groups": ["10001"], "sweep_interval": 900, "sweep_batch": 2,
+               "group_opts": {"10001": {"sweep_interval": 600}}}, f)
+cfg2 = w.load_cfg(legacy2, None)
+check("老的 sweep_interval 换成 sweep_every", cfg2["sweep_every"] == 900)
+check("老的 sweep_batch 不再留着", "sweep_batch" not in cfg2)
+check("星球里的老键也跟着换", cfg2["group_opts"]["10001"].get("sweep_every") == 600
+      and "sweep_interval" not in cfg2["group_opts"]["10001"])
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n全部通过 (%d 项)" % ok)

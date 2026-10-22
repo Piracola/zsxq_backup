@@ -37,7 +37,7 @@ from telegram.constants import ParseMode
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler,
                           CommandHandler, MessageHandler, filters)
 
-from tg_topics import COMMENT_PAGE, LIST_PAGE, Archive
+from tg_topics import COMMENT_PAGE, LIST_PAGE, Archive, snap, snap_list
 from zsxq_archive import (E_RE, collect_files, log, save_json, topic_blocks,
                           topic_gone)
 
@@ -100,6 +100,11 @@ def _inline_html(s):
 def _plain(s):
     """去掉标记, 用于标题这类纯文本位置。"""
     return _html.unescape(re.sub(r"<[^>]+>", "", _inline_html(s)))
+
+
+def _plain_tags(s):
+    """把已经拼好的 HTML 还原成能当纯文本发的内容 —— parse_mode 被关掉时用。"""
+    return _html.unescape(TAG_RE.sub("", s or ""))
 
 
 def _quote(s_html):
@@ -360,14 +365,14 @@ class TgBot(threading.Thread):
                    "check_interval": [300, 900, 3600, 21600, 86400, 0],
                    "recent_days": [1, 3, 7, 30],
                    "max_comments": [0, 20, 50, 100],
-                   "sweep_interval": [1800, 3600, 10800, 21600, 0],
-                   "sweep_batch": [1, 2, 3],
+                   "sweep_every": [600, 1800, 3600, 10800, 21600, 0],
+                   "sweep_size": [5, 10, 20, 30],
                    "quiet_hours": [[0, 0], [23, 7], [22, 8], [0, 7]],
                    "keep_media": [True, False]}
     OPT_NAMES = {"poll_interval": "抓取间隔", "page_size": "每轮条数",
                  "check_interval": "删除复查", "recent_days": "复查范围",
-                 "max_comments": "评论上限", "sweep_interval": "评论抽查",
-                 "sweep_batch": "抽查条数", "quiet_hours": "夜间静默",
+                 "max_comments": "评论上限", "sweep_every": "评论抽查",
+                 "sweep_size": "抽查条数", "quiet_hours": "夜间静默",
                  "keep_media": "图片附件"}
     OPT_HELP = {
         "poll_interval": "多久去星球看一眼有没有新内容。调大更省请求，调小发现得更快。",
@@ -375,11 +380,23 @@ class TgBot(threading.Thread):
         "check_interval": "老话题会慢慢掉出列表，所以隔一段时间单独问一次「它还在不在」。这是两次确认之间的最短间隔。",
         "recent_days": "只复核最近这几天的话题。更早的不再花请求去确认。",
         "max_comments": "每个话题最多存多少条评论。0 = 全部，星球再热闹也一条不漏。",
-        "sweep_interval": "隔多久把一个话题的评论区整段翻一遍。评论数字看不见的那部分（楼中楼被删、涨了又跌回原数）只有翻一遍才发现。",
-        "sweep_batch": "每轮最多翻几条评论区。调大核得更勤，但每轮多花几个请求。",
+        "sweep_every": "隔多久开一批，把一批话题的评论区整段翻一遍。评论数字看不见的那部分（楼中楼被删、涨了又跌回原数）只有翻一遍才发现。",
+        "sweep_size": "一批翻几条。挑的是最久没核过的话题，窗口里的迟早都轮到；一批会摊在接下来几次轮询里，一次一个请求。",
         "quiet_hours": "这段时间里不去星球抓内容（机器人照常在线），省得半夜刷请求。",
         "keep_media": "存不存图片和附件。关掉只留文字和链接，省磁盘。",
     }
+    # 手动填数值: 每一项的输入单位 / 存进去要乘的系数 / 允许范围
+    MANUAL = {
+        "poll_interval": ("秒", 1, 5, 3600),
+        "page_size": ("条", 1, 5, 30),
+        "check_interval": ("分钟", 60, 0, 1440),
+        "recent_days": ("天", 1, 1, 365),
+        "max_comments": ("条", 1, 0, 500),
+        "sweep_every": ("分钟", 60, 0, 1440),
+        "sweep_size": ("条", 1, 1, 50),
+    }
+    UNIT_SEC = {"秒": 1, "分": 60, "分钟": 60, "时": 3600, "小时": 3600,
+                "天": 86400, "条": 1, "个": 1}
 
     def __init__(self, sent):
         super().__init__(daemon=True, name="tg-bot")
@@ -398,6 +415,7 @@ class TgBot(threading.Thread):
         self._finds = {}         # 搜索结果缓存: 编号 -> (关键词, 命中列表)
         self._find_seq = 0
         self._opt_change = None  # 刚改过的设置, 设置页用来回一句「改成了什么」
+        self._pending = {}       # (chat_id, user_id) -> (gid, key, 时间): 正等着发一个数字过来
         if not self.token:
             return
         self.app = (Application.builder().token(self.token)
@@ -410,6 +428,7 @@ class TgBot(threading.Thread):
         a.add_handler(CommandHandler("groups", self.cmd_groups))
         a.add_handler(CommandHandler("status", self.cmd_status))
         a.add_handler(CommandHandler("login", self.cmd_login))
+        a.add_handler(CommandHandler("cancel", self.cmd_cancel))
         # 不是命令的一句话 = 按标题搜备份
         a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.cmd_search))
         for pat, fn in (
@@ -430,6 +449,8 @@ class TgBot(threading.Thread):
                 (r"^P:\d+$", self.cb_latest),
                 (r"^Q:\d+$", self.cb_dump_live),
                 (r"^[ipcdmxyqw]:\d+$", self.cb_opt),
+                (r"^Y:\d+$", self.cb_manual),
+                (r"^X:\d+:[a-z_]+$", self.cb_manual_pick),
                 (r"^n:\d+$", self.cb_comment_alert),
                 (r"^a:\d+$", self.cb_autopush), (r"^k:\d+$", self.cb_keep),
                 (r"^s:\d+$", self.cb_set)):
@@ -442,7 +463,8 @@ class TgBot(threading.Thread):
         try:
             await app.bot.set_my_commands([
                 BotCommand("menu", "主菜单"), BotCommand("groups", "我的星球"),
-                BotCommand("status", "哨兵状态"), BotCommand("login", "微信扫码更新凭证")])
+                BotCommand("status", "哨兵状态"), BotCommand("login", "微信扫码更新凭证"),
+                BotCommand("cancel", "取消正在等你的输入")])
         except Exception as e:
             log("[!] setMyCommands 失败: %s" % str(e)[:100])
         log("[+] Telegram 机器人已启动 (python-telegram-bot %s)" % telegram.__version__)
@@ -507,7 +529,7 @@ class TgBot(threading.Thread):
 
     def _find_gid(self, topic):
         tid = str(topic.get("topic_id"))
-        for key in (self.s.state or {}):
+        for key in snap(self.s.state):
             g, t = key.split("/", 1) if "/" in key else ("", "")
             if t == tid:
                 return g
@@ -517,9 +539,19 @@ class TgBot(threading.Thread):
     # ---- 发送 ----
 
     async def _send(self, chat_id, text, kb=None):
+        body = _clip(text)
         try:
-            await self.app.bot.send_message(chat_id, _clip(text), parse_mode=ParseMode.HTML,
+            await self.app.bot.send_message(chat_id, body, parse_mode=ParseMode.HTML,
                                             link_preview_options=NOPREVIEW, reply_markup=kb)
+        except telegram.error.BadRequest as e:
+            # HTML 被拒(半截标签、没转义的 &、星球名里带 <): 退回纯文本再发一次,
+            # 总比什么都不显示强 —— 光标在页面上, 用户看得见内容
+            log("[!] HTML 被拒, 退回纯文本重发: %s" % str(e)[:120])
+            try:
+                await self.app.bot.send_message(chat_id, _plain_tags(body), parse_mode=None,
+                                                link_preview_options=NOPREVIEW, reply_markup=kb)
+            except Exception as e2:
+                log("[!] Telegram 发送失败: %s" % str(e2)[:150])
         except Exception as e:
             log("[!] Telegram 发送失败: %s" % str(e)[:150])
 
@@ -654,6 +686,15 @@ class TgBot(threading.Thread):
                 await self._send(update.effective_chat.id, msg)
             raise ApplicationHandlerStop
         self.remember_chat(update)
+        # 「等你发数字」这个状态很容易把人卡住: 点别的按钮、发别的命令, 都当作已经不填了。
+        # /cancel 例外, 它自己会回一句「好, 不填了」。
+        msg = getattr(update, "message", None)
+        q = getattr(update, "callback_query", None)
+        chat = getattr(msg, "chat_id", None) or getattr(getattr(q, "message", None), "chat_id", None)
+        user = update.effective_user.id if update.effective_user else 0
+        text = getattr(msg, "text", "") or ""
+        if chat and (q is not None or (text.startswith("/") and not text.startswith("/cancel"))):
+            self._pending.pop((chat, user), None)
         return None
 
     def admins_or_any_chat(self):
@@ -743,13 +784,27 @@ class TgBot(threading.Thread):
         rows = []
         for key, prefix in (("poll_interval", "i"), ("page_size", "p"),
                             ("check_interval", "c"), ("recent_days", "d"),
-                            ("max_comments", "m"), ("sweep_interval", "x"),
-                            ("sweep_batch", "y"), ("quiet_hours", "q"),
+                            ("max_comments", "m"), ("sweep_every", "x"),
+                            ("sweep_size", "y"), ("quiet_hours", "q"),
                             ("keep_media", "w")):
             rows.append([InlineKeyboardButton(
                 "%s · %s" % (self.OPT_NAMES[key], self._opt_value(key, self.s.opt(g, key))),
                 callback_data="%s:%s" % (prefix, g))])
+        rows.append([InlineKeyboardButton("✏️ 手动填数值", callback_data="Y:" + g)])
         rows.append([InlineKeyboardButton("◀ 返回该星球", callback_data="g:" + g)])
+        return InlineKeyboardMarkup(rows)
+
+    def kb_manual(self, gid):
+        """手动填数值时先选一项; 单位写在按钮上, 免得用户不知道填的是什么。"""
+        g = str(gid)
+        rows = []
+        for key in ("poll_interval", "page_size", "check_interval", "recent_days",
+                    "max_comments", "sweep_every", "sweep_size"):
+            unit = self.MANUAL[key][0]
+            rows.append([InlineKeyboardButton(
+                "%s（%s）" % (self.OPT_NAMES[key], unit),
+                callback_data="X:%s:%s" % (g, key))])
+        rows.append([InlineKeyboardButton("◀ 返回设置", callback_data="s:" + g)])
         return InlineKeyboardMarkup(rows)
 
     @staticmethod
@@ -763,13 +818,85 @@ class TgBot(threading.Thread):
         if n < 60:
             return "%d 秒" % n
         if n < 3600:
-            return "%d 分钟" % (n // 60)
-        return "%d 小时" % (n // 3600) if n < 86400 else "%d 天" % (n // 86400)
+            m, s = divmod(n, 60)
+            return ("%d 分钟" % m) if not s else ("%d 分 %d 秒" % (m, s))
+        if n < 86400:
+            h, rest = divmod(n, 3600)
+            m = rest // 60
+            return ("%d 小时" % h) if not m else ("%d 小时 %d 分" % (h, m))
+        d, rest = divmod(n, 86400)
+        h = rest // 3600
+        return ("%d 天" % d) if not h else ("%d 天 %d 小时" % (d, h))
 
     @staticmethod
     def _fmt_quiet(v):
         q = (list(v or []) + [0, 0])[:2]
         return "关闭" if q[0] == q[1] else "%d 点–%d 点" % (q[0], q[1])
+
+    @classmethod
+    def _read_num(cls, text, unit):
+        """把用户发来的话读成一个数, 单位是 unit:
+        '90' / '90 秒' / '2分钟' / '1.5小时' / '7 天' 都认; 读不出来给 None。"""
+        s = (text or "").strip().replace(" ", "").replace("，", "")
+        if not s:
+            return None
+        mult = cls.UNIT_SEC.get(unit, 1)
+        for name in sorted(cls.UNIT_SEC, key=len, reverse=True):
+            if s.endswith(name) and len(s) > len(name):
+                s, mult = s[:-len(name)], cls.UNIT_SEC[name]
+                break
+        try:
+            n = float(s)
+        except ValueError:
+            return None
+        # nan/inf/天文数字都不接: 后面乘系数、转 int 会炸, 而且也没意义
+        if n != n or n < 0 or n > 1e9:
+            return None
+        return n * mult / cls.UNIT_SEC.get(unit, 1)
+
+    def manual_value(self, key, text):
+        """把一句话变成这个设置该存的值。读不出来就返回 (None, 原因)。"""
+        unit, factor, lo, hi = self.MANUAL[key]
+        n = self._read_num(text, unit)
+        if n is None:
+            return None, "「%s」不像一个数字" % (text or "").strip()[:20]
+        value = int(round(n * factor))
+        if not (lo * factor <= value <= hi * factor):
+            return None, "只能在 %s–%s %s 之间" % (lo, hi, unit)
+        return value, ""
+
+    def pending_get(self, chat_id, user_id):
+        """取出等着填的那一项。超过 5 分钟就当没这回事 —— 隔了很久的一句话
+        多半是想搜索或者干别的, 不能当成数字吃掉。"""
+        item = self._pending.get((chat_id, user_id))
+        if not item:
+            return None
+        gid, key, ts = item
+        if time.time() - ts > 300:
+            self._pending.pop((chat_id, user_id), None)
+            return None
+        return (gid, key)
+
+    def pending_put(self, chat_id, user_id, gid, key):
+        self._pending[(chat_id, user_id)] = (gid, key, time.time())
+
+    async def apply_manual(self, update, pending):
+        """用户发来的那句话当成数字用; 读不出来就再问一次, 别把他的话丢了。"""
+        chat = update.effective_chat.id
+        who = update.effective_user.id if update.effective_user else 0
+        gid, key = pending
+        value, why = self.manual_value(key, update.message.text or "")
+        if value is None:
+            self.pending_put(chat, who, gid, key)     # 还等着, 下次再说
+            await self._send(chat, "\n".join([
+                "这个我没用上：%s。" % _html.escape(why),
+                "「%s」要一个%s数，再发一次就行；不想填了就发 /cancel。"
+                % (self.OPT_NAMES[key], self.MANUAL[key][0])]))
+            return
+        self.s.set_opt(gid, key, value)
+        self._opt_change = (key, value)
+        self.save_pref()
+        await self._send(chat, self.set_text(gid), self.kb_set(gid))
 
     def _opt_value(self, key, value):
         """把设置值说成人话。按钮和设置页都用它。"""
@@ -783,17 +910,17 @@ class TgBot(threading.Thread):
             return "最近 %d 天" % int(value or 0)
         if key == "max_comments":
             return "全部" if not int(value or 0) else "%d 条" % int(value)
-        if key == "sweep_interval":
+        if key == "sweep_every":
             return "关" if not int(value or 0) else self._fmt_sec(value)
-        if key == "sweep_batch":
-            return "每轮 %d 条" % int(value or 1)
+        if key == "sweep_size":
+            return "每批 %d 条" % int(value or 20)
         if key == "quiet_hours":
             return self._fmt_quiet(value)
         if key == "keep_media":
             return "下载" if value else "跳过"
         return str(value)
 
-    def _opt_meaning(self, key, value):
+    def _opt_meaning(self, key, value, gid=None):
         """刚改成这个值, 意味着什么。设置页改完回一句。"""
         if key == "poll_interval":
             return "以后去星球的间隔是 %s，新内容最晚这么久之后被发现。" % self._fmt_sec(value)
@@ -807,12 +934,14 @@ class TgBot(threading.Thread):
         if key == "max_comments":
             return ("每个话题的评论全抓，一条不漏。" if not int(value or 0)
                     else "每个话题最多存 %d 条评论，再多就不抓了。" % int(value))
-        if key == "sweep_interval":
-            return ("不再整段翻评论区，评论只跟着数字走（楼中楼被删就看不见了）。"
+        if key == "sweep_every":
+            return ("不再翻评论区，评论只跟着数字走（楼中楼被删就看不见了）。"
                     if not int(value or 0) else
-                    "同一话题大约每 %s 被整段核一遍，话题多的时候会慢慢轮到。" % self._fmt_sec(value))
-        if key == "sweep_batch":
-            return "每轮最多翻 %d 条评论区 —— 多翻一条就多一个请求。" % int(value or 1)
+                    "一批翻完、且距上一次开批满 %s，才开下一批。"
+                    % self._fmt_sec(value))
+        if key == "sweep_size":
+            return ("一批翻 %d 条 —— 摊在接下来 %d 次轮询里，一次一个请求。先挑最久没核过的。"
+                    % (int(value or 20), int(value or 20)))
         if key == "quiet_hours":
             return ("夜里也照常抓，不再静默。" if self._fmt_quiet(value) == "关闭"
                     else "这段时间（%s）不去星球抓内容，机器人照常在线。" % self._fmt_quiet(value))
@@ -836,20 +965,35 @@ class TgBot(threading.Thread):
     async def cmd_login(self, update, context):
         context.application.create_task(self.do_login(update.effective_chat.id))
 
+    async def cmd_cancel(self, update, context):
+        chat = update.effective_chat.id
+        who = update.effective_user.id if update.effective_user else 0
+        had = self._pending.pop((chat, who), None)
+        if had:
+            await self._send(chat, "好，这次不填了，设置还是原来的样子。发 /menu 回主菜单。")
+        else:
+            await self._send(chat, "现在没有等你填的数值。发 /menu 回主菜单。")
+
     async def cmd_search(self, update, context):
         word = (update.message.text or "").strip()
-        code = update.effective_chat.id
+        chat = update.effective_chat.id
+        who = update.effective_user.id if update.effective_user else 0
+        pending = self.pending_get(chat, who)
+        if pending:                      # 刚才在等一个数字, 这句话就当成那个数字
+            self._pending.pop((chat, who), None)
+            await self.apply_manual(update, pending)
+            return
         if not word:
             return
-        await self._send(code, "正在翻本地备份的标题找「%s」…" % _html.escape(word[:20]))
+        await self._send(chat, "正在翻本地备份的标题找「%s」…" % _html.escape(word[:20]))
         hits = await asyncio.to_thread(self.archive.search, self.s.state, word)
         if not hits:
-            await self._send(code, "没找到标题里带「%s」的备份。\n\n"
+            await self._send(chat, "没找到标题里带「%s」的备份。\n\n"
                                    "（只按标题搜，不搜正文。发 /menu 回主菜单。）"
                              % _html.escape(word[:20]))
             return
         token = self._remember_find(word, hits)
-        await self._send(code, *self._list_view(hits, 1, "🔎 标题含「%s」" % _html.escape(word[:20]),
+        await self._send(chat, *self._list_view(hits, 1, "🔎 标题含「%s」" % _html.escape(word[:20]),
                                                origin="A", gid=None, token=token, with_group=True))
 
     # ---- 按钮 ----
@@ -1017,11 +1161,40 @@ class TgBot(threading.Thread):
         await q.answer()
         key, gid = q.data.split(":", 1)
         name = {"i": "poll_interval", "p": "page_size", "c": "check_interval",
-                "d": "recent_days", "m": "max_comments", "x": "sweep_interval",
-                "y": "sweep_batch", "q": "quiet_hours",
+                "d": "recent_days", "m": "max_comments", "x": "sweep_every",
+                "y": "sweep_size", "q": "quiet_hours",
                 "w": "keep_media"}[key]
         self.cycle_opt(gid, name)
         await self._show(q, self.set_text(gid), self.kb_set(gid))
+
+    async def cb_manual(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        gid = q.data.split(":", 1)[1]
+        await self._show(q, "\n".join([
+            "✏️ <b>手动填数值</b>",
+            "",
+            "点一项，然后直接发一个数字给我，单位写在括号里。",
+            "带单位也行，比如「2分钟」「45秒」。"]), self.kb_manual(gid))
+
+    async def cb_manual_pick(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        _, gid, key = q.data.split(":")
+        self.pending_put(q.message.chat_id, q.from_user.id, gid, key)
+        unit, _factor, lo, hi = self.MANUAL[key]
+        ex = {"秒": "45", "条": "20", "分钟": "30", "天": "7"}[unit]
+        tip = "发一个数字过来，单位是%s，比如「%s」。范围 %s–%s。" % (unit, ex, lo, hi)
+        if key in ("check_interval", "sweep_every"):
+            tip += "填 0 就是关掉。"
+        elif key == "max_comments":
+            tip += "填 0 就是全抓，不限条数。"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀ 返回设置", callback_data="s:" + gid)]])
+        await self._show(q, "\n".join([
+            "✏️ <b>%s</b>：现在是 %s" % (self.OPT_NAMES[key], self._opt_value(key, self.s.opt(gid, key))),
+            "", tip,
+            "改主意了就发 /cancel。"]), kb)
 
     # ---- 页面 ----
 
@@ -1122,7 +1295,7 @@ class TgBot(threading.Thread):
         return "%s %s%s" % (day, title[:16], marks)
 
     def _events_page(self, page):
-        evs = list(getattr(self.s, "events", []) or [])
+        evs = snap_list(getattr(self.s, "events", None))
         evs.reverse()                                   # 新到旧
         rows, lines = [], ["📋 <b>最近变动</b>", ""]
         if not evs:
@@ -1175,7 +1348,7 @@ class TgBot(threading.Thread):
                   "", "这条的存档文件不在了（可能被「保留条数」清掉过）。",
                   "点下面的「跟服务器核对一次」，我当场去问一下。"]
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 跟服务器核对一次", callback_data="U:%s:%s:L:%d" % (gid, tid, page))],
+                InlineKeyboardButton("🔄 跟服务器核对一次", callback_data="U:%s:%s:%s:%d" % (gid, tid, src, page))],
                 [InlineKeyboardButton(self._back_label(src), callback_data=self._back_cb(gid, src, page))]])
             return "\n".join(L), kb
         L.append("星球：%s" % _html.escape(gname))
@@ -1273,7 +1446,7 @@ class TgBot(threading.Thread):
         pieces = ["\n".join(head)]
         for label, text, images in topic_blocks(topic):
             body = _inline_html(text).strip()
-            if len(body) > MAXLEN:
+            if _u16(body) > MAXLEN:      # 按 UTF-16 算, 不然一堆 emoji 会漏过判断被悄悄切掉
                 body = _clip(body, MAXLEN - 200) + "\n（后面太长，省略了；完整正文在备份的 .md 里）"
             part = []
             if label:
@@ -1300,7 +1473,20 @@ class TgBot(threading.Thread):
                  or self.archive.title(gid, tid, rec))
         total = len(comments)
         have = Archive.comment_total(comments)     # 跟接口的 comments_count 同口径
-        pages = max(1, (total + COMMENT_PAGE - 1) // COMMENT_PAGE)
+        blocks, cur, size = [], [], 0
+        for i, c in enumerate(comments, 1):        # 先渲染好每条, 再决定一页放几条
+            b = [_fmt_comment(c, i)]
+            for r in (c.get("replied_comments") or []):
+                b.append(_fmt_comment(r, i, parent=c))
+            b = "\n".join(b) + "\n"
+            w = _u16(b)
+            if cur and size + w > MAXLEN - 500:    # 留出页眉和计数行的位置
+                blocks.append("\n".join(cur))
+                cur, size = [], 0
+            cur.append(b)
+            size += w
+        blocks.append("\n".join(cur))
+        pages = max(1, len(blocks))
         page = int(page or 0)
         page = pages if page <= 0 else max(1, min(page, pages))
         L = ["💬 <b>%s</b> 的评论" % _html.escape(title[:60]), ""]
@@ -1313,7 +1499,6 @@ class TgBot(threading.Thread):
                 [InlineKeyboardButton("🔄 从星球拉一次", callback_data="Z:%s:%s" % (gid, tid))],
                 [InlineKeyboardButton("◀ 回话题", callback_data="T:%s:%s:L:1" % (gid, tid))]])
             return "\n".join(L), kb
-        chunk = comments[(page - 1) * COMMENT_PAGE:page * COMMENT_PAGE]
         L.append("%d 条评论%s · 第 %d/%d 页 · 按时间从早到晚" % (
             have, ("（含 %d 条楼中楼）" % (have - total)) if have > total else "",
             page, pages))
@@ -1325,12 +1510,7 @@ class TgBot(threading.Thread):
                      "删掉的内容本地还留着，不用补。"
                      % (int(rec["cc"]), have - int(rec["cc"])))
         L.append("")
-        start = (page - 1) * COMMENT_PAGE
-        for i, c in enumerate(chunk, start + 1):
-            L.append(_fmt_comment(c, i))
-            for r in (c.get("replied_comments") or []):
-                L.append(_fmt_comment(r, i, parent=c))
-            L.append("")
+        L.append(blocks[page - 1])
         nav = []
         if page > 1:
             nav.append(InlineKeyboardButton("◀ 上一页", callback_data="C:%s:%s:%d" % (gid, tid, page - 1)))
@@ -1386,6 +1566,14 @@ class TgBot(threading.Thread):
         idx = revs.index(n)
         prev = self.archive.load_rev(gid, tid, revs[idx - 1]) if idx else self.archive.load(gid, tid)
         cur = self.archive.load_rev(gid, tid, n)
+        if not cur:
+            # 快照刚被「保留条数」清掉, 缓存里还挂着: 拿空壳去比会显示成「整篇都是新增」
+            self.archive.forget_revs(gid)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀ 回话题", callback_data="T:%s:%s:L:1" % (gid, tid))]])
+            return ("✏️ 「%s」这份改动快照已经不在了。\n\n"
+                    "多半是被「保留条数」清掉了 —— 列表已经刷新，回话题页看还有哪几次。"
+                    % _html.escape(title[:60])), kb
         diff = Archive.diff_topics(prev.get("topic") or {}, cur.get("topic") or {})
         when = (cur.get("_fetched_at") or "")[:16]
         L = ["✏️ <b>%s</b>" % _html.escape(title[:60]),
@@ -1416,11 +1604,12 @@ class TgBot(threading.Thread):
         if changed:
             key, value = changed
             L += ["✅ 刚把「%s」改成 %s。" % (self.OPT_NAMES[key], self._opt_value(key, value)),
-                  self._opt_meaning(key, value), ""]
+                  self._opt_meaning(key, value, g), ""]
         L.append("点一行就换下一个值，改完立刻生效，也写回 watch.json，重启不丢。")
+        L.append("想要列表里没有的值，点最下面那行，直接发个数字给我。")
         L.append("")
         for key in ("poll_interval", "page_size", "check_interval", "recent_days",
-                    "max_comments", "sweep_interval", "sweep_batch",
+                    "max_comments", "sweep_every", "sweep_size",
                     "quiet_hours", "keep_media"):
             L.append("<b>%s（%s）</b> — %s" % (self.OPT_NAMES[key],
                                               self._opt_value(key, self.s.opt(g, key)),
@@ -1444,11 +1633,11 @@ class TgBot(threading.Thread):
              "本次运行记录到 %d 次变动" % events]
         if not s.gnames:
             L.append("星球名单：还没拉到（凭证多半失效了，发 /login）")
-        auto = [s.gnames.get(g, g) for g, on in self.autopush.items() if on]
+        auto = [_html.escape(s.gnames.get(g, g)) for g, on in self.autopush.items() if on]
         L.append("自动推送：%s" % (", ".join(auto) if auto else "没开"))
         keeps = {g: int(v) for g, v in (s.cfg.get("group_keep") or {}).items() if v}
         L.append("限量星球：%s" % (
-            ", ".join("%s→%d 条" % (s.gnames.get(g, g), n) for g, n in keeps.items())
+            ", ".join("%s→%d 条" % (_html.escape(s.gnames.get(g, g)), n) for g, n in keeps.items())
             if keeps else "都不限量"))
         L += ["", "<b>各星球的节奏</b>"]
         for g in (s.cfg.get("groups") or []):
@@ -1554,15 +1743,22 @@ class TgBot(threading.Thread):
         await self._send(chat_id, text, InlineKeyboardMarkup(rows))
 
     async def dump_live(self, chat_id, gid):
-        """把刚拉到的那一页, 按老样子一条条发全文 (正文 + 图)。"""
+        """把刚拉到的那一页, 按老样子一条条发全文 (正文 + 图)。
+        一次最多发 12 条 —— 连发几十条正文加相册, 一定会撞上 Telegram 的限流,
+        被限流的那部分就这样悄悄没了。剩下的说一声, 让用户自己决定还要不要。"""
         topics = [t for (g, _), t in self._live.items() if g == str(gid)]
         if not topics:
             await self.show_latest(chat_id, gid)
             return
         gname = self.s.gnames.get(gid, gid)
-        for t in topics:
+        cap = 12
+        for t in topics[:cap]:
             await self._send_topic(chat_id, t, gname, gid)
             await asyncio.sleep(0.8)             # 别把频道刷到限流
+        if len(topics) > cap:
+            await self._send(chat_id, "一次最多发 %d 条（这次一共 %d 条），剩下的没发 —— "
+                                      "连发这么多正文加相册会被 Telegram 限流。"
+                                      "要点名看哪条，去「最近话题」里点它。" % (cap, len(topics)))
 
     def _remember_live(self, gid, topics):
         for t in topics:
