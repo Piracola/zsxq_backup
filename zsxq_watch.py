@@ -8,10 +8,14 @@ zsxq_watch.py — 知识星球云端哨兵
   * 复查搭同一趟车: 列表里每条已归档话题都当场比对修改时间与评论数, 不多发请求。
     只有"本轮窗口内本该出现、却没出现"的话题才单独确认一次:
       - 确认被删  → 快照写入 deleted/ 并发 IM 告警
-      - 内容被编辑 → 修订版另存 raw/gid/tid__rev_N.json, 发告警
-      - 评论数下降 → 发告警 (评论被删的前兆)
-  * 抓取节奏逐个星球可调: 间隔、每轮页数、复查周期与窗口、评论上限、是否下图。
-    Telegram 机器人的「抓取设置」里点按钮就能改, 不用手改 watch.json。
+      - 内容被编辑 → 修订版另存 raw/gid/tid__rev_N.json, 发告警 + 逐行差异
+      - 评论数变化 → 拉一次评论, 跟本地基线比出新增/消失的那几条, 连同是谁说的
+                     一起告警 (comment_alert 分四档: 都提醒 / 只看新增 / 只看减少 / 全关)
+  * 评论抽查: 每轮顺手把一个话题的评论区整段翻一遍 (默认 1 条), 兜住那个计数看不见的
+    变化 —— 楼中楼被删 (平台数字常常不跟着减)、一轮之内涨了又跌回原数、增量拉漏的回复。
+    注意 comments_count 数的是「主评论 + 楼中楼」, 有人回复楼中楼数字是会动的。
+  * 抓取节奏逐个星球可调: 间隔、每轮页数、复查周期与窗口、评论上限、是否下图、
+    夜间静默、评论提醒档位、评论抽查密度。Telegram 机器人的「抓取设置」里点按钮就能改。
   * 凭证失效自动告警 (6 小时冷却), 凭证本身仍需手机端提取:
       python zsxq_token.py --json cred.json
   * IM 告警渠道: 企业微信机器人 / 钉钉机器人 / Telegram / Bark / 通用 webhook
@@ -22,22 +26,12 @@ zsxq_watch.py — 知识星球云端哨兵
 配置写在 watch.json (首次运行自动生成模板), 告警渠道全在里面。
 """
 import argparse, json, os, random, sys, time, urllib.parse, urllib.request
+from collections import deque
 from zsxq_archive import (Client, download, collect_images, collect_files,
-                          render_md, topic_filename, safe_name, log)
+                          render_md, topic_filename, safe_name, save_json,
+                          topic_gone, topic_title, log)
+from tg_topics import Archive
 from tg_bot import TgBot
-
-API = "https://api.zsxq.com"
-
-
-def _topic_gone(resp):
-    """接口明确说"话题不存在/已删除"才算删除信号 (code 1007)。
-    限流、5xx、网络错误、权限问题都不算 —— 这些留到下一轮复核, 别误报。"""
-    try:
-        if int(resp.get("code")) == 1007:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return "不存在或已被删除" in str(resp.get("error") or "")
 
 
 DEFAULT_CFG = {
@@ -49,7 +43,10 @@ DEFAULT_CFG = {
     "check_batch": 10,         # 每轮最多确认几条, 免得一次性扎堆
     "recent_days": 3,          # 确认范围上限: 只确认最近 N 天的话题
     "max_comments": 0,         # 每个话题最多抓多少条评论; 0 = 全部
+    "sweep_interval": 1800,    # 评论抽查: 同一话题两次整段翻评论区的最小间隔 (秒); 0 = 不抽查
+    "sweep_batch": 1,          # 每轮最多抽查几条话题的评论区
     "keep_media": True,        # 是否下载图片与附件; False 只留 raw JSON 里的远程链接
+    "comment_alert": "both",   # 评论提醒: both 都报 / added 只报新增 / removed 只报减少 / off 全关
     "quiet_hours": [0, 0],     # 夜间静默 [起, 止] 本地小时, 支持跨零点 [22,6]; 起=止 表示不静默
     "notify_new": False,       # 新话题是否也发通知
     "auth_cache_ttl": 1800,    # 凭证自检结果复用秒数(省掉每轮一次 whoami); 0 = 每轮都查
@@ -69,6 +66,16 @@ DEFAULT_CFG = {
 # 老版本的独立复查配置, 检测并入每轮抓取后不再使用
 RETIRED = ("check_archived", "verify_gap", "confirm_gap")
 
+ALERT_MODES = ("both", "added", "removed", "off")
+
+
+def _alert_mode(v):
+    """评论提醒的取值。新写法是四档字符串, 老写法是 True/False, 两种都收。"""
+    if isinstance(v, bool):
+        return "both" if v else "off"
+    s = str(v or "").strip().lower()
+    return s if s in ALERT_MODES else "both"
+
 
 def _ts(s):
     """create_time → 秒; 解析不了就当 0, 不要让它抛异常。"""
@@ -80,12 +87,30 @@ def _ts(s):
 
 def load_cfg(path, cli_groups):
     cfg = dict(DEFAULT_CFG)
+    # 这两项会被 set_opt / cycle_keep 写进去, 先各复制一份, 别跟 DEFAULT_CFG 共用同一个 dict
+    cfg["group_opts"] = {}
+    cfg["group_keep"] = {}
     if os.path.exists(path):
         try:
             user = json.load(open(path, encoding="utf-8"))
             cfg.update(user)
             cfg["notify"] = dict(DEFAULT_CFG["notify"])
             cfg["notify"].update(user.get("notify") or {})
+            # notify_comments (True/False) 换成 comment_alert 四档; 按原来的意思翻译过来
+            if "notify_comments" in cfg:
+                old = _alert_mode(cfg.pop("notify_comments"))
+                if "comment_alert" not in user:
+                    cfg["comment_alert"] = old
+                    log("[·] notify_comments 换成四档的 comment_alert 了 "
+                        "(both/added/removed/off), 这次按 %s 算" % old)
+            cfg["comment_alert"] = _alert_mode(cfg.get("comment_alert"))
+            for o in (cfg.get("group_opts") or {}).values():
+                if not isinstance(o, dict):
+                    continue
+                if "notify_comments" in o:
+                    o.setdefault("comment_alert", _alert_mode(o.pop("notify_comments")))
+                if "comment_alert" in o:
+                    o["comment_alert"] = _alert_mode(o["comment_alert"])
             gone = [k for k in RETIRED if k in user]
             if gone:
                 log("[·] 这些配置项已停用, 可以从 watch.json 删掉: %s (检测已并入每轮抓取)" %
@@ -93,7 +118,7 @@ def load_cfg(path, cli_groups):
         except Exception as e:
             log("[!] 配置文件解析失败, 使用默认配置: %s" % e)
     else:
-        json.dump(cfg, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        save_json(path, cfg, indent=1)
         log("[+] 已生成配置模板 %s — 告警渠道请填进里面的 notify 字段" % path)
     if cli_groups:
         cfg["groups"] = cli_groups
@@ -110,6 +135,9 @@ class Sentinel:
         cred = json.load(open(cred_path, encoding="utf-8"))
         self.cli = Client(cred["access_token"], cred.get("aduid"),
                           sleep=max(0.2, cfg.get("api_sleep", 1.0)))
+        self.archive = Archive(out)       # 备份目录的视图, 机器人也用这个
+        self.events = deque(maxlen=200)   # 最近变动 (只在内存里, 机器人「最近变动」页读它)
+        self.last_poll = {}               # gid -> 上次成功看过列表的时间
         self.gnames = {}          # gid -> 名称
         self._groups_at = 0.0     # 上次拉星球名单的时间
         self._auth_fail_ts = 0.0  # 凭证告警冷却
@@ -148,8 +176,13 @@ class Sentinel:
         return (qs <= h < qe) if qs < qe else (h >= qs or h < qe)
 
     def save_state(self):
-        json.dump(self.state, open(self.state_path, "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=1)
+        save_json(self.state_path, self.state, indent=1)
+
+    def add_event(self, kind, gid, tid, title, note=""):
+        """记一笔变动, 给机器人的「最近变动」页看。只在内存里, 重启就清空。"""
+        self.events.append({"t": time.time(), "kind": kind, "gid": str(gid),
+                            "tid": str(tid), "title": (title or "")[:80],
+                            "note": (note or "")[:80]})
 
     def auth_ok(self, force=False):
         """凭证自检。auth_cache_ttl 秒内直接复用上次结果, 不再每轮都问 whoami。
@@ -228,6 +261,13 @@ class Sentinel:
                         os.remove(p)
                     except OSError:
                         pass
+            rev = 1
+            while os.path.exists(self.archive.rev_path(gid, tid, rev)):   # 修订快照一起清
+                try:
+                    os.remove(self.archive.rev_path(gid, tid, rev))
+                except OSError:
+                    pass
+                rev += 1
             v = self.state.pop(k, None)
             md = v and v.get("file")
             if md:
@@ -255,7 +295,8 @@ class Sentinel:
             log("[!] 告警发送失败: %s" % str(e)[:120])
             return 0
 
-    def notify(self, title, text=""):
+    def notify(self, title, text="", skip_telegram=False):
+        """IM 告警。skip_telegram: 机器人已经用带按钮的消息推过了, 别重复发一条。"""
         n = self.cfg.get("notify") or {}
         body = (title + "\n" + text).strip()
         if n.get("wecom"):
@@ -264,7 +305,7 @@ class Sentinel:
         if n.get("dingtalk"):
             self._post(n["dingtalk"], {"msgtype": "markdown", "markdown": {
                 "title": title, "text": "## %s\n\n%s" % (title, text)[:18000]}})
-        if n.get("telegram") and n.get("telegram_chat_id"):
+        if n.get("telegram") and n.get("telegram_chat_id") and not skip_telegram:
             self._post("https://api.telegram.org/bot%s/sendMessage" % n["telegram"],
                        {"chat_id": n["telegram_chat_id"],
                         "text": body[:4000], "disable_web_page_preview": True})
@@ -305,10 +346,9 @@ class Sentinel:
         comments = (self.cli.comments(tid, limit=limit)
                     if (topic.get("comments_count") or 0) > 0 else [])
         rawpath = os.path.join(rawdir, "%s.json" % tid)
-        with open(rawpath, "w", encoding="utf-8") as f:
-            json.dump({"topic": topic, "comments": comments, "_group": gname,
-                       "_fetched_at": time.strftime("%Y-%m-%d %H:%M:%S")},
-                      f, ensure_ascii=False)
+        payload = {"topic": topic, "comments": comments, "_group": gname,
+                   "_fetched_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        save_json(rawpath, payload)
 
         url2name, file_names = [], []
         if self.opt(gid, "keep_media"):
@@ -321,11 +361,8 @@ class Sentinel:
                 if u and download(u, os.path.join(gdir, "files", nm)):
                     file_names.append((u, nm, size, dur))
         if url2name or file_names:
-            with open(rawpath, "w", encoding="utf-8") as f:
-                json.dump({"topic": topic, "comments": comments, "_group": gname,
-                           "_img_map": url2name, "_files": file_names,
-                           "_fetched_at": time.strftime("%Y-%m-%d %H:%M:%S")},
-                          f, ensure_ascii=False)
+            payload.update({"_img_map": url2name, "_files": file_names})
+            save_json(rawpath, payload)
 
         fname = topic_filename(topic)
         with open(os.path.join(gdir, fname), "w", encoding="utf-8") as f:
@@ -335,7 +372,9 @@ class Sentinel:
             "file": os.path.relpath(os.path.join(gdir, fname), self.out),
             "time": topic.get("create_time"),
             "mtime": topic.get("modify_time") or "",
-            "cc": topic.get("comments_count") or 0}
+            "cc": topic.get("comments_count") or 0,
+            "swept": time.time(),        # 评论刚拉过, 别让抽查立刻又翻一遍
+            "title": topic_title(topic)[:80]}
         return rawpath
 
     def poll_group(self, gid):
@@ -346,6 +385,7 @@ class Sentinel:
         page = self.latest_page(gid)
         if not page:
             return
+        self.last_poll[gid] = time.time()
         seen, dirty = {}, False
         for topic in page:
             tid = str(topic.get("topic_id"))
@@ -359,16 +399,105 @@ class Sentinel:
             log("    [新话题] %s %s" % (tid, (topic.get("title") or "")[:30]))
             self.archive_topic(gid, gname, topic)
             self.save_state()
+            self.add_event("new", gid, tid, topic_title(topic), "新话题已备份")
             if self.autopush_on(gid) and self.bot and self.bot.admins_or_any_chat():
-                self.bot.push_topic(topic, gname)
+                self.bot.push_topic(topic, gname, gid)
             if self.opt(gid, "notify_new"):
                 self.notify("📥 新话题已备份",
                             "星球: %s\n标题: %s\n%s" % (
                                 gname, (topic.get("title") or "")[:60],
                                 self.topic_link(gid, tid)))
+        if self.sweep_comments(gid):   # 顺手翻一两条评论区, 补上评论数看不出的变化
+            dirty = True
         if dirty:                      # 基线变了才落盘, 别每轮都重写 state.json
             self.save_state()
         self.check_window(gid, page, seen)
+
+    def sweep_comments(self, gid):
+        """轮着把评论区整段翻一遍。评论数这个数字看不见的三件事全靠它:
+        楼中楼里有人回复、有人删楼中楼, 以及一轮之内涨了又跌回原数。
+        每轮最多翻 sweep_batch 条, 同一话题两次之间至少隔 sweep_interval。"""
+        every = int(self.opt(gid, "sweep_interval") or 0)
+        batch = int(self.opt(gid, "sweep_batch") or 0)
+        if every <= 0 or batch <= 0 or self.opt(gid, "comment_alert") == "off":
+            return False
+        now = time.time()
+        days = int(self.opt(gid, "recent_days") or 0)
+        cand = []
+        for key, v in self.state.items():
+            if not key.startswith(gid + "/") or v.get("deleted"):
+                continue
+            if not (v.get("cc") or 0):
+                continue                  # 没评论的话题不用翻; 一旦有人评论, 数量那条路会管
+            ct = v.get("time") or ""
+            if days and ct and _ts(ct) < now - days * 86400:
+                continue
+            last = float(v.get("swept") or 0)
+            if now - last < every:
+                continue
+            cand.append((last, key))
+        if not cand:
+            return False
+        cand.sort()                       # 最久没翻过的先翻
+        for _, key in cand[:batch]:
+            tid = key.split("/", 1)[1]
+            self.state[key]["swept"] = now    # 翻了就记下 (失败也记, 免得同一话题连着几轮硬撞)
+            try:
+                self.sweep_one(gid, tid, key)
+            except Exception as e:
+                log("[!] 评论抽查出错 %s: %s" % (tid, str(e)[:120]))
+        return True
+
+    def sweep_one(self, gid, tid, key):
+        """整段拉一遍评论区跟本地比。比对和推送都复用评论变动那一套, 只是触发原因不同。"""
+        raw = self.archive.load(gid, tid)
+        if not raw:
+            return
+        v = self.state[key]
+        stored = Archive.comments_of(raw)
+        limit = int(self.opt(gid, "max_comments") or 0)
+        fetched = self.cli.comments(tid, limit=limit)
+        if not fetched:
+            return
+        cc_old = int(v.get("cc") or 0)
+        # 口径要跟接口一致: comments_count 是「主评论 + 楼中楼」的总条数
+        got = Archive.comment_total(fetched)
+        complete = (not limit) or got >= cc_old
+        added, gone = Archive.diff_comments(stored, fetched)
+        if not complete:
+            gone = []                     # 没拉全, 不能说谁不见了
+        if not added and not gone:
+            log("    [·] 抽查评论区: %s 没有变化" % tid)
+            return
+        cc = got if complete else max(cc_old, got)
+        if added or cc != cc_old:
+            self.archive.append_comments(gid, tid, fetched, cc=cc)
+        # 数量对齐到刚看到的, 下一轮列表就不会把同一件事再报一遍
+        v["cc"] = cc
+        mode = self.opt(gid, "comment_alert")
+        show_added = [] if mode == "removed" else added
+        show_gone = [] if mode == "added" else gone
+        if not show_added and not show_gone:
+            log("    [·] 抽查评论区: %s 有变化, 但这一档不提醒" % tid)
+            return
+        title = v.get("title") or tid
+        gname = self.gnames.get(gid, gid)
+        note = "抽查：多了 %d 条、少了 %d 条（评论数 %d）" % (
+            len(show_added), len(show_gone), cc)
+        log("    [!] 抽查评论区: %s 新增 %d 条、少了 %d 条%s" % (
+            tid, len(show_added), len(show_gone),
+            (", 比对不完整" if not complete else "")))
+        self.add_event("comment", gid, tid, title, note)
+        pushed = bool(self.bot) and self.bot.push_comment_change(
+            gid, tid, title, gname, cc, show_added, show_gone, complete)
+        lines = [note]
+        for c, parent in (show_added + show_gone)[:5]:
+            who = ((c.get("owner") or {}).get("name")) or "?"
+            body = " ".join((c.get("text") or "").split())[:60] or "(图片)"
+            lines.append("· %s: %s" % (who, body))
+        self.notify("💬 抽查发现评论有变化", "星球: %s\n标题: %s\n%s\n%s" % (
+            gname, title[:60], "\n".join(lines), self.topic_link(gid, tid)),
+            skip_telegram=pushed)
 
     def check_window(self, gid, page, seen):
         """窗口内本该出现、这轮却没出现的话题, 才值得单独发一次请求确认。
@@ -407,7 +536,7 @@ class Sentinel:
                 self.on_detail(gid, tid, key,
                                (d.get("resp_data") or {}).get("topic") or {})
                 continue
-            if _topic_gone(d):
+            if topic_gone(d):
                 self.on_deleted(gid, key, d)          # 缺席 + 明确报不存在 = 删除
                 continue
             # 限流/5xx/网络异常: 既不是删除证据, 也得先排除凭证这个最常见的原因
@@ -426,34 +555,37 @@ class Sentinel:
         """该星球是否开了机器人自动推送; 没配 admin 时只推给第一个私聊过机器人的用户。"""
         return bool(self.bot and self.bot.autopush.get(str(gid)))
 
-
     def on_deleted(self, gid, key, resp):
         """窗口内缺席, 单独确认时接口明确报不存在 → 定性为删除。"""
         tid = key.split("/", 1)[1]
         v = self.state[key]
+        title = v.get("title") or ""
         rec = {"topic_id": tid, "group_id": gid, "group": self.gnames.get(gid, gid),
-               "title": "", "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "title": title, "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                "api_resp": resp}
         rawp = os.path.join(self.out, "raw", gid, "%s.json" % tid)
         if os.path.exists(rawp):
             raw = json.load(open(rawp, encoding="utf-8"))
-            rec["title"] = (raw.get("topic") or {}).get("title") or ""
+            title = (raw.get("topic") or {}).get("title") or title
+            rec["title"] = title
             rec["raw_snapshot"] = raw
-        ddir = os.path.join(self.out, "deleted", gid)
-        os.makedirs(ddir, exist_ok=True)
-        with open(os.path.join(ddir, "%s.json" % tid), "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, indent=1)
+        save_json(self.archive.deleted_path(gid, tid), rec, indent=1)
         v["deleted"] = True
         v.pop("gone_seen", None)
-        log("    [!] 话题确认被删除: %s %s" % (tid, rec["title"][:30]))
+        log("    [!] 话题确认被删除: %s %s" % (tid, title[:30]))
+        self.add_event("gone", gid, tid, title, "服务器上已删除")
+        pushed = bool(self.bot) and self.bot.push_deleted(
+            gid, tid, topic_title({"title": title}), self.gnames.get(gid, gid))
         self.notify("🚨 话题被删除 (已备份在手)",
                     "星球: %s\n标题: %s\n备份: %s\n详情: %s" % (
                         rec["group"], rec["title"][:80] or "(无标题)",
-                        rawp, self.topic_link(gid, tid)))
+                        rawp, self.topic_link(gid, tid)),
+                    skip_telegram=pushed)
 
     def on_detail(self, gid, tid, key, topic):
         """拿一条话题的当前数据比对基线。列表返回的字段与详情接口完全一致,
-        所以这一步不花任何请求。只关心修改时间与评论数两项。"""
+        所以比对本身不花任何请求; 只有真变了才去抓评论 / 存修订版。
+        关心两件事: 内容改没改, 评论数变没变。"""
         v = self.state[key]
         v.pop("gone_seen", None)
         if v.get("deleted"):             # 又被恢复了(或是之前误判): 撤销删除标记
@@ -466,41 +598,150 @@ class Sentinel:
             return True
         old_m, old_cc = v.get("mtime") or "", v.get("cc") or 0
         v["mtime"], v["cc"] = mtime, cc
-        changed = []
+        dirty = False
+        if cc != old_cc:
+            dirty = self.on_comment_change(gid, tid, key, topic, old_cc, cc) or dirty
         # 没编辑过的话题 modify_time 是空的, 第一次被编辑才出现 → 空字符串也当基线用
         if mtime != old_m and (mtime or old_m):
-            changed.append("内容被编辑 (%s → %s)" % (old_m[:19] or "无", mtime[:19]))
-        if cc < old_cc:
-            changed.append("评论数下降 (%d → %d)" % (old_cc, cc))
-        if not changed:
-            return False
-        # 修订快照另存, 原始 raw 不动。列表里的正文可能被服务端截断, 这里单独拉一次全量
+            dirty = self.on_edited(gid, tid, key, topic, old_cc, cc) or dirty
+        return dirty
+
+    def on_comment_change(self, gid, tid, key, topic, old_cc, new_cc):
+        """评论数变了。涨还是跌, 从数字本身就知道, 不花请求;
+        要说出「谁说了什么」才去拉评论 —— 所以提醒档位决定了花多少请求。"""
+        title = topic_title(topic) or self.state[key].get("title") or tid
         gname = self.gnames.get(gid, gid)
+        grew = new_cc > old_cc
+        note = "%d → %d 条评论" % (old_cc, new_cc)
+        self.add_event("comment", gid, tid, title, note)      # 不管哪一档, 本地都留一笔
+        mode = self.opt(gid, "comment_alert")
+        if mode == "off":
+            log("    [·] 评论数变化: %s (%s), 评论提醒已全关" % (tid, note))
+            return True
+        want = (mode == "both" or (mode == "added" and grew)
+                or (mode == "removed" and not grew))
+        if not want and not grew:
+            # 只有「只提醒新增」碰上评论变少会走到这: 不在意的方向, 一个请求都不花
+            log("    [·] 评论变少: %s (%s), 这一档只报新增, 不处理" % (tid, note))
+            return True
+        if not self.archive.load(gid, tid):
+            log("    [·] 评论数变化: %s (%s), 本地没这条的存档, 没有基线可比" % (tid, note))
+            return True
+        added, gone, complete, fetched = self.comment_delta(gid, tid, old_cc, new_cc)
+        if not want:
+            # 「只提醒减少」碰上新增: 新评论照样补进存档, 只是不出声
+            log("    [·] 评论有变动: %s (%s) 新增 %d 条, 已入档, 这一档不提醒" % (
+                tid, note, len(added)))
+            return True
+        log("    [!] 评论有变动: %s (%s) 新增 %d 条、少了 %d 条%s" % (
+            tid, note, len(added), len(gone), (", 比对不完整" if not complete else "")))
+        if not added and not gone and complete:
+            log("    [·] 数字动了但评论一条没变 (比如子回复被删), 不发消息")
+            return True
+        # 文本告警 (企业微信 / 钉钉 / Bark / webhook 用)
+        lines = [note]
+        for c, parent in added[:5]:
+            who = ((c.get("owner") or {}).get("name")) or "?"
+            if parent is not None:
+                who += " 回复 " + (((c.get("repliee") or {}).get("name")) or "?")
+            body = " ".join((c.get("text") or "").split())[:60] or "(图片)"
+            lines.append("· %s: %s" % (who, body))
+        for c, parent in gone[:5]:
+            who = ((c.get("owner") or {}).get("name")) or "?"
+            body = " ".join((c.get("text") or "").split())[:60] or "(图片)"
+            lines.append("· 不见了 —— %s: %s" % (who, body))
+        if not complete:
+            lines.append("（评论上限挡着，只比了前面那部分；调成「全部」就齐了）")
+        pushed = bool(self.bot) and self.bot.push_comment_change(
+            gid, tid, title, gname, new_cc, added, gone, complete)
+        self.notify("💬 话题评论有变动", "星球: %s\n标题: %s\n%s\n%s" % (
+            gname, title[:60], "\n".join(lines), self.topic_link(gid, tid)),
+            skip_telegram=pushed)
+        return True
+
+    def comment_delta(self, gid, tid, old_cc, new_cc):
+        """评论数变了 → 拉一次评论跟本地基线比。返回 (新增, 消失, 是否比全了, 抓到的评论)。
+        涨了只要新的那几条 (begin_time 游标), 拿到的是尾巴, 不能拿来判断谁消失了;
+        掉了才整段拉一遍, 那时才有资格说少了谁。"""
+        raw = self.archive.load(gid, tid)
+        stored = Archive.comments_of(raw)
+        limit = int(self.opt(gid, "max_comments") or 0)
+        if not raw:
+            # 本地没存档 (清理过或从未成功备份), 没有基线可比, 别把整串评论说成「新来的」
+            return [], [], False, self.cli.comments(tid, limit=limit)
+        complete = True
+        if new_cc > old_cc and stored:
+            begin = max((c.get("create_time") or "") for c in stored) or None
+            fetched = self.cli.comments(tid, limit=0, begin=begin)
+            added, _tail = Archive.diff_comments(stored, fetched)
+            gone = []                             # 只拉到尾巴, 老评论不在里面很正常
+            if not fetched:                       # 游标什么都没给回来: 整段拉一次兜底
+                fetched = self.cli.comments(tid, limit=limit)
+                added, gone = Archive.diff_comments(stored, fetched)
+                complete = (not limit) or Archive.comment_total(fetched) >= new_cc
+        else:
+            fetched = self.cli.comments(tid, limit=limit)
+            added, gone = Archive.diff_comments(stored, fetched)
+            # 只取了前 limit 条就没法断言「谁不见了」, 也别谎报比全了
+            complete = (not limit) or Archive.comment_total(fetched) >= new_cc
+        if not complete:
+            gone = []
+        if fetched:
+            self.archive.append_comments(gid, tid, fetched, cc=new_cc)
+        return added, gone, complete, fetched
+
+    def on_edited(self, gid, tid, key, topic, old_cc, new_cc):
+        """话题被编辑: 存一份修订快照, 算好逐行差异再告警。"""
+        gname = self.gnames.get(gid, gid)
+        # 列表里的正文可能被服务端截断, 这里单独拉一次全量
         d = self.cli.req("/v2/topics/%s" % tid)
         snap = ((d.get("resp_data") or {}).get("topic") or {}) if d.get("succeeded") else {}
         snap = snap or topic
-        n = 1
-        while os.path.exists(os.path.join(self.out, "raw", gid, "%s__rev_%d.json" % (tid, n))):
-            n += 1
-        revp = os.path.join(self.out, "raw", gid, "%s__rev_%d.json" % (tid, n))
+        n = self.archive.next_rev(gid, tid)
+        prev = (self.archive.load_rev(gid, tid, n - 1) if n > 1
+                else self.archive.load(gid, tid))
         limit = int(self.opt(gid, "max_comments") or 0)
-        comments = self.cli.comments(tid, limit=limit) if cc > 0 else []
-        with open(revp, "w", encoding="utf-8") as f:
-            json.dump({"topic": snap, "comments": comments, "_group": gname,
-                       "_fetched_at": time.strftime("%Y-%m-%d %H:%M:%S")},
-                      f, ensure_ascii=False)
-        log("    [!] 话题有变动: %s (%s)" % (tid, "; ".join(changed)))
-        self.notify("✏️ 话题内容有变动",
-                    "星球: %s\n标题: %s\n%s\n快照: %s" % (
-                        gname, (snap.get("title") or topic.get("title") or "")[:80],
-                        "; ".join(changed), revp))
+        # 评论提醒全关 = 不再追评论; 修订快照只存话题本身, 不为它去拉评论
+        chase = self.opt(gid, "comment_alert") != "off"
+        comments = self.cli.comments(tid, limit=limit) if (chase and new_cc > 0) else []
+        self.archive.save_rev(gid, tid, n, {
+            "topic": snap, "comments": comments, "_group": gname,
+            "_fetched_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+        self.state[key]["revs"] = n
+        title = topic_title(snap) or topic_title(topic) or self.state[key].get("title") or tid
+        diff = Archive.diff_topics(prev.get("topic") or {}, snap)
+        change = "；".join("%s 新增 %d 行、删掉 %d 行" % (d0["label"], d0["added"], d0["removed"])
+                           for d0 in diff) or "正文没变，可能只改了图片或附件"
+        log("    [!] 话题有改动: %s (第 %d 次) %s" % (tid, n, change))
+        self.add_event("edit", gid, tid, title, "第 %d 次改动·%s" % (n, change))
+        pushed = bool(self.bot) and self.bot.push_edit_change(
+            gid, tid, title, gname, n, diff)
+        self.notify("✏️ 话题内容有变动", "星球: %s\n标题: %s\n%s\n快照: %s\n%s" % (
+            gname, title[:80], change,
+            self.archive.rev_path(gid, tid, n), self.topic_link(gid, tid)),
+            skip_telegram=pushed)
         return True
 
     # ---------- 主循环 ----------
 
     def rebuild_index(self):
+        """重建 index.md。老档案的 state 里没有标题, 这里顺手补一次 (之后就一直带着了),
+        否则索引和机器人的清单里全是「(无标题)」。"""
         try:
             from zsxq_archive import build_index
+            missing = [k for k, v in self.state.items() if not v.get("title")]
+            filled = 0
+            for key in missing:
+                gid, tid = key.split("/", 1) if "/" in key else ("", "")
+                if not gid:
+                    continue
+                t = topic_title((self.archive.load(gid, tid) or {}).get("topic") or {})
+                if t:
+                    self.state[key]["title"] = t[:80]
+                    filled += 1
+            if filled:
+                log("[·] 给 %d 条老档案补上了标题" % filled)
+                self.save_state()
             groups = [{"group_id": g, "name": n} for g, n in self.gnames.items()]
             build_index(self.out, groups, self.state)
         except Exception as e:
@@ -574,22 +815,27 @@ class Sentinel:
                     base = 60                    # 出异常就多歇一会再试
                 next_run[g] = time.time() + base * random.uniform(0.75, 1.25)
 
-    def describe(self, gid):
-        """把某个星球的实际节奏写成一行, 启动日志和 /status 都用它。"""
+    def describe(self, gid, with_name=True):
+        """把某个星球的实际节奏写成一行, 启动日志 / /status / 星球页都用它。"""
         def fmt(sec):
             if sec < 60:
-                return "%.0fs" % sec
+                return "%.0f 秒" % sec
             if sec < 3600:
-                return "%.0f分" % (sec / 60.0)
-            return "%.0f小时" % (sec / 3600.0)
+                return "%.0f 分钟" % (sec / 60.0)
+            return "%.0f 小时" % (sec / 3600.0)
         ci = int(self.opt(gid, "check_interval") or 0)
-        return "%s: 每 %s 抓一次 · %d 条/轮 · 复查 %s · 评论 %s · %s" % (
-            self.gnames.get(gid, gid), fmt(float(self.opt(gid, "poll_interval") or 30)),
+        sw = int(self.opt(gid, "sweep_interval") or 0)
+        qs, qe = (list(self.opt(gid, "quiet_hours") or [0, 0]) + [0, 0])[:2]
+        body = "每 %s 抓一次 · %d 条/轮 · 删除复查 %s · 评论 %s · %s%s%s" % (
+            fmt(float(self.opt(gid, "poll_interval") or 30)),
             int(self.opt(gid, "page_size") or 20),
-            ("关闭" if ci <= 0 else "每" + fmt(float(ci))),
+            ("关闭" if ci <= 0 else "每 " + fmt(float(ci))),
             ("全部" if not int(self.opt(gid, "max_comments") or 0)
              else "%d 条" % int(self.opt(gid, "max_comments"))),
-            ("下图" if self.opt(gid, "keep_media") else "不下图"))
+            ("下图" if self.opt(gid, "keep_media") else "不下图"),
+            ("" if sw <= 0 else " · 抽查 每 " + fmt(float(sw))),
+            ("" if qs == qe else " · %d-%d 点静默" % (qs, qe)))
+        return ("%s: %s" % (self.gnames.get(str(gid), str(gid)), body)) if with_name else body
 
 
 def main():

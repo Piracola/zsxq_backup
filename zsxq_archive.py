@@ -36,6 +36,18 @@ def log(m):
     print(m, flush=True)
 
 
+def save_json(path, obj, indent=None):
+    """原子落盘: 先写同目录临时文件再 replace。
+    读的人(机器人和哨兵不在一个线程里)永远不会碰到半截 JSON。"""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=indent)
+    os.replace(tmp, path)
+
+
 def safe_name(s, maxlen=60):
     s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", (s or "").strip())
     s = re.sub(r"\s+", " ", s).strip(" .")
@@ -63,6 +75,25 @@ def render_text(s):
             return "**%s**" % title
         return title
     return E_RE.sub(rep, s)
+
+
+BLOCKS = (("", "talk"), ("提问", "question"), ("回答", "answer"),
+          ("作业", "task"), ("解答", "solution"))
+
+
+def topic_blocks(topic):
+    """按固定顺序给出正文区块: [(标签, 原文, 图片列表)]。
+    标签是空串的那块就是话题正文; 只有图没有字也算一块。"""
+    out = []
+    for label, key in BLOCKS:
+        node = topic.get(key)
+        if not isinstance(node, dict):
+            continue
+        text = node.get("text") or ""
+        images = node.get("images") or []
+        if text.strip() or images:
+            out.append((label, text, images))
+    return out
 
 
 class Client:
@@ -150,12 +181,13 @@ class Client:
             if not end:
                 return
 
-    def comments(self, tid, limit=0):
+    def comments(self, tid, limit=0, begin=None):
         """评论翻页: 必须用 begin_time 游标 (page= 参数无效)。
-        limit > 0 时只取前 limit 条, 用来限制单话题的请求量。"""
-        out, seen, cursor = [], set(), None
+        begin 给了就从这个时间往后取 (补新评论用); limit > 0 时只取这么多条。
+        with_sticky=true: 不带这个参数, 星主置顶的那条评论不会出现在结果里。"""
+        out, seen, cursor = [], set(), begin or None
         while True:
-            q = "count=%d&sort=asc" % COMMENT_PAGE
+            q = "count=%d&sort=asc&with_sticky=true" % COMMENT_PAGE
             if cursor:
                 q += "&begin_time=" + urllib.parse.quote(cursor)
             d = self.req("/v2/topics/%s/comments?%s" % (tid, q))
@@ -270,28 +302,20 @@ def render_md(topic, comments, url2name, group_name):
         L.append("- 标签: %s" % render_text(topic["annotation"]).strip())
     L += ["", "---", ""]
 
-    def block(label, node):
-        if not node:
-            return
-        tx = render_text(node.get("text") or "").strip()
+    for label, text, images in topic_blocks(topic):
+        tx = render_text(text).strip()
         if label:
             L.append("**【%s】**" % label)
         if tx:
             L.append(tx)
             L.append("")
-        for im in (node.get("images") or []):
+        for im in images:
             u = (im.get("large") or im.get("original") or {}).get("url")
             if not u:
                 continue
             nm = url2name.get(u)
             L.append("![图片](%s)" % ("images/" + urllib.parse.quote(nm) if nm else u))
             L.append("")
-
-    block(None, talk)
-    block("提问", q)
-    block("回答", a)
-    block("作业", topic.get("task"))
-    block("解答", topic.get("solution"))
 
     total_replies = sum(len(c.get("replied_comments") or []) for c in comments)
     if comments:
@@ -341,6 +365,17 @@ def render_md(topic, comments, url2name, group_name):
     return "\n".join(L)
 
 
+def topic_gone(resp):
+    """接口明确说「话题不存在/已删除」才算删除信号 (code 1007)。
+    限流、5xx、网络错误、权限问题都不算 —— 这些留到下一轮复核, 别误报。"""
+    try:
+        if int((resp or {}).get("code")) == 1007:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "不存在或已被删除" in str((resp or {}).get("error") or "")
+
+
 def topic_title(topic):
     title = render_text(topic.get("title") or "").strip()
     if not title:
@@ -360,16 +395,26 @@ def topic_filename(topic):
 
 
 def build_index(out, groups, state):
+    """人看的索引: 一条话题一行, 时间 + 标题 + 评论数 + 状态标记。
+    标题取 state 里记下的 (新档案都有); 老档案没记标题就只显示时间, 不改写文件。"""
     with open(os.path.join(out, "index.md"), "w", encoding="utf-8") as f:
-        f.write("# 知识星球备份索引\n\n")
+        f.write("# 知识星球备份索引\n\n按时间从新到旧。🚫 = 服务器上已删除 · ✏️ = 被改过\n")
         for g in groups:
             gid, gname = str(g.get("group_id")), g.get("name") or ""
             # 按时间排, 不是按话题 ID —— ID 是无序的, 按它排出来新内容会散在中间
-            rows = sorted((v["time"], v["file"]) for k, v in state.items()
-                          if k.startswith(gid + "/"))
+            rows = []
+            for k, v in state.items():
+                if not k.startswith(gid + "/"):
+                    continue
+                marks = (" 🚫" if v.get("deleted") else "") + (" ✏️" if v.get("revs") else "")
+                rows.append(((v.get("time") or ""), v.get("file") or "",
+                             v.get("title") or "", v.get("cc") or 0, marks))
+            rows.sort()
             f.write("\n## %s (%s) — %d 条\n\n" % (gname, gid, len(rows)))
-            for t, path in rows[::-1]:
-                f.write("- [%s](%s)\n" % (t[:10], urllib.parse.quote(path)))
+            for t, path, title, cc, marks in rows[::-1]:
+                head = "%s %s" % (t[:16].replace("T", " "), title or "(无标题)")
+                f.write("- [%s](%s)%s · 💬%d\n"
+                        % (head, urllib.parse.quote(path), marks, int(cc or 0)))
 
 
 def main():

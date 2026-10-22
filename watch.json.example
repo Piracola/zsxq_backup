@@ -7,7 +7,10 @@
   "check_batch": 10,
   "recent_days": 3,
   "max_comments": 0,
+  "sweep_interval": 1800,
+  "sweep_batch": 1,
   "keep_media": true,
+  "comment_alert": "both",
 
   "quiet_hours": [0, 0],
   "notify_new": false,
