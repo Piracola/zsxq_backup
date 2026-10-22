@@ -35,6 +35,7 @@
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -54,6 +55,7 @@ from telegram.ext import ApplicationHandlerStop
 
 import tg_bot
 import tg_topics
+import tg_update
 import zsxq_archive as za
 import zsxq_watch as w
 
@@ -94,6 +96,7 @@ def fake_sentinel(**cfg):
     s._auth_dirty = False
     s._last_prune = 0.0
     s._index_dirty = False
+    s._restart = None
     s.bot = None
     s.archive_topic = lambda gid, gname, topic: s.state.__setitem__(
         "%s/%s" % (gid, topic.get("topic_id")),
@@ -103,7 +106,8 @@ def fake_sentinel(**cfg):
     for n in ("opt", "set_opt", "in_quiet", "latest_page", "poll_group", "check_window",
               "on_detail", "on_comment_change", "comment_delta", "on_edited", "on_deleted",
               "sweep_comments", "sweep_one", "_sweep_pick", "_fetch_comments",
-              "auth_ok", "describe", "autopush_on", "add_event"):
+              "auth_ok", "describe", "autopush_on", "add_event",
+              "request_restart", "hand_over"):
         setattr(s, n, getattr(w.Sentinel, n).__get__(s))
     s.topic_link = w.Sentinel.topic_link       # staticmethod, 不要绑到实例上
     return s
@@ -119,6 +123,8 @@ def new_bot(sent, **attrs):
     b._finds = {}
     b._find_seq = 0
     b._opt_change = None
+    b._upd = None
+    b._last_update = {}
     for k, v in attrs.items():
         setattr(b, k, v)
     return b
@@ -1201,6 +1207,79 @@ check("老的 sweep_interval 换成 sweep_every", cfg2["sweep_every"] == 900)
 check("老的 sweep_batch 不再留着", "sweep_batch" not in cfg2)
 check("星球里的老键也跟着换", cfg2["group_opts"]["10001"].get("sweep_every") == 600
       and "sweep_interval" not in cfg2["group_opts"]["10001"])
+
+# ---------- 26 版本与更新 ----------
+cur = tg_update.current()
+check("能认出自己在哪一版", bool(re.fullmatch(r"[0-9a-f]{6,10}", cur.get("hash") or ""))
+      and bool(cur.get("subject")), str(cur)[:80])
+
+s26 = fake_sentinel()
+b26 = new_bot(s26)
+txt = b26.version_text()
+check("版本页说清现在跑的是哪一版", cur["hash"] in txt and "分支" in txt)
+check("没查过远端就说还没查过", "还没问过远端" in txt)
+
+b26._upd = {"ok": True, "behind": 0, "commits": []}
+check("远端没新的就说已经最新", "已经是最新的" in b26.version_text())
+check("没新提交时不摆「更新并重启」", "R:u" not in callbacks(b26.kb_version()))
+
+b26._upd = {"ok": True, "behind": 3, "commits": [("abc1234", "加了个抽查"), ("def5678", "修了个转义")]}
+t3 = b26.version_text()
+check("远端有新提交就列出来", "远端有 <b>3</b> 个新提交" in t3 and "加了个抽查" in t3)
+check("有新提交才给「更新并重启」", "R:u" in callbacks(b26.kb_version()))
+
+b26._upd = {"ok": False, "error": "git 超时了（60 秒），多半是网络不通", "behind": 0}
+check("检查失败时把原因说出来", "多半是网络不通" in b26.version_text())
+
+b26._last_update = {"from": "aaaaaaa", "to": "bbbbbbb", "when": "10-22 16:30"}
+_kb26 = b26.kb_version()
+_labels26 = [btn.text for row in _kb26.inline_keyboard for btn in row]
+check("更新过就给「回到上一版」", "R:b" in callbacks(_kb26)
+      and any("回到 aaaaaaa" in t for t in _labels26), str(_labels26)[:120])
+
+# 交接: 记录 -> 落盘 -> 换进程。execv 在测试里换成记录一下就走, 绝不真的换掉自己
+s27 = fake_sentinel()
+s27.state = {"10001/a1": {"time": "2026-10-20T08:00:00", "cc": 0, "title": "甲"}}
+s27.request_restart("更新到 bbbbbbb")
+check("点了更新会记下重启请求", (s27._restart or {}).get("note") == "更新到 bbbbbbb")
+
+ran = []
+real_exec = os.execv
+os.execv = lambda p, a: ran.append((p, a))
+try:
+    s27.hand_over()
+finally:
+    os.execv = real_exec
+check("重启时会真的换成新代码", len(ran) == 1 and ran[0][1][1].endswith(".py"), str(ran)[:80])
+check("重启前把请求清掉, 免得起来又重启一次", s27._restart is None)
+mark = za.load_json(os.path.join(s27.out, "restart.json"), {}) or {}
+check("留了张纸条告诉用户更新到哪一版", mark.get("note") == "更新到 bbbbbbb"
+      and bool(mark.get("version")), str(mark)[:80])
+
+# 起来之后把那句话发出去, 纸条只announce一次
+ann = []
+
+
+class _AnnBot(tg_bot.TgBot):
+    def __init__(self):
+        self.admins = {"777"}
+        self._chat_id = None
+
+
+ab = _AnnBot()
+ab.s = s27
+ab.app = type("App", (), {"bot": _PickyBot()})()
+asyncio.run(ab._announce_restart())
+check("重启后回来说一声", any("回来了" in t for t in ab.app.bot.got), str(ab.app.bot.got)[:80])
+asyncio.run(ab._announce_restart())
+check("纸条只announce一次", len(ab.app.bot.got) == 1)
+
+# 拉下来的代码先过一遍语法检查, 过不了就别拿去重启
+badpy = os.path.join(TMP, "broken.py")
+with open(badpy, "w", encoding="utf-8") as f:
+    f.write("def f(:\n    pass\n")
+check("编译检查能认出坏掉的代码", bool(tg_update._compile_check([badpy])))
+check("编译检查不冤枉好代码", not tg_update._compile_check(["tg_bot.py", "README.md"]))
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n全部通过 (%d 项)" % ok)

@@ -38,7 +38,8 @@ from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHand
                           CommandHandler, MessageHandler, filters)
 
 from tg_topics import COMMENT_PAGE, LIST_PAGE, Archive, snap, snap_list
-from zsxq_archive import (E_RE, collect_files, log, save_json, topic_blocks,
+import tg_update
+from zsxq_archive import (E_RE, collect_files, log, save_json, load_json, topic_blocks,
                           topic_gone)
 
 MAXLEN = 3900                     # Telegram 单条上限 4096, 留出标签余量
@@ -199,6 +200,10 @@ def _short(ts):
     """2026-10-14T11:07:00 → 10-14 11:07"""
     t = (ts or "").replace("T", " ")
     return t[5:16] if len(t) >= 16 else t
+
+
+def _short_now():
+    return time.strftime("%m-%d %H:%M")
 
 
 def _type_name(topic):
@@ -416,6 +421,8 @@ class TgBot(threading.Thread):
         self._find_seq = 0
         self._opt_change = None  # 刚改过的设置, 设置页用来回一句「改成了什么」
         self._pending = {}       # (chat_id, user_id) -> (gid, key, 时间): 正等着发一个数字过来
+        self._upd = None         # 上一次「检查更新」的结果, 版本页用来显示
+        self._last_update = load_json(os.path.join(sent.out, "update.json"), {}) or {}
         if not self.token:
             return
         self.app = (Application.builder().token(self.token)
@@ -453,7 +460,10 @@ class TgBot(threading.Thread):
                 (r"^X:\d+:[a-z_]+$", self.cb_manual_pick),
                 (r"^n:\d+$", self.cb_comment_alert),
                 (r"^a:\d+$", self.cb_autopush), (r"^k:\d+$", self.cb_keep),
-                (r"^s:\d+$", self.cb_set)):
+                (r"^s:\d+$", self.cb_set),
+                (r"^R:$", self.cb_version), (r"^R:c$", self.cb_update_check),
+                (r"^R:u$", self.cb_update_ask), (r"^R:y$", self.cb_update_do),
+                (r"^R:r$", self.cb_restart), (r"^R:b$", self.cb_rollback)):
             a.add_handler(CallbackQueryHandler(fn, pattern=pat))
 
     # ---- 生命周期 ----
@@ -468,6 +478,41 @@ class TgBot(threading.Thread):
         except Exception as e:
             log("[!] setMyCommands 失败: %s" % str(e)[:100])
         log("[+] Telegram 机器人已启动 (python-telegram-bot %s)" % telegram.__version__)
+        await self._announce_restart()
+
+    async def _announce_restart(self):
+        """更新/重启之后回来说一声, 免得用户盯着一个十几秒没动静的机器人猜。"""
+        path = os.path.join(self.s.out, "restart.json")
+        try:
+            info = load_json(path, None)
+        except Exception:
+            info = None
+        if not info:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        chat = self.push_chat_id() if callable(getattr(self, "push_chat_id", None)) else None
+        if not chat:
+            return
+        L = ["✅ <b>回来了</b>（%s）" % _html.escape(str(info.get("note") or "重启"))]
+        if info.get("version"):
+            L.append("现在跑的是 <code>%s</code>%s" % (
+                _html.escape(str(info["version"])),
+                (" · " + _html.escape(str(info.get("when") or ""))) if info.get("when") else ""))
+        await self._send(chat, "\n".join(L))
+
+    def shutdown_quietly(self, timeout=5):
+        """重启前先把 getUpdates 停下来, 免得新进程起来撞上 409 Conflict。"""
+        loop, app = getattr(self, "_loop", None), getattr(self, "app", None)
+        if not (loop and app):
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(app.stop(), loop)
+            fut.result(timeout)
+        except Exception as e:
+            log("[!] 停 Telegram polling 失败: %s" % str(e)[:100])
 
     def run(self):
         if not self.app:
@@ -744,7 +789,8 @@ class TgBot(threading.Thread):
             [InlineKeyboardButton("🗂 最近话题", callback_data="A:1"),
              InlineKeyboardButton("📋 最近变动", callback_data="E:1")],
             [InlineKeyboardButton("📊 哨兵状态", callback_data="status")],
-            [InlineKeyboardButton("🔐 扫码更新凭证", callback_data="login")]])
+            [InlineKeyboardButton("🔐 扫码更新凭证", callback_data="login")],
+            [InlineKeyboardButton("🔄 版本与更新", callback_data="R:")]])
 
     def kb_groups(self):
         if not self.s.gnames:                    # 名单还没拉上来, 先给回菜单, 别给一排空按钮
@@ -1015,6 +1061,88 @@ class TgBot(threading.Thread):
         q = update.callback_query
         await q.answer()
         await self._show(q, await asyncio.to_thread(self.status_text))
+
+    async def cb_version(self, update, context):
+        q = update.callback_query
+        await q.answer()
+        await self._show(q, self.version_text(), self.kb_version())
+
+    async def cb_update_check(self, update, context):
+        q = update.callback_query
+        await q.answer("去问一下远端…")
+        self._upd = await asyncio.to_thread(tg_update.check)
+        await self._show(q, self.version_text(), self.kb_version())
+
+    async def cb_update_ask(self, update, context):
+        """更新是个有代价的动作 (会重启、会短暂失联), 先让人看一眼再点确认。"""
+        q = update.callback_query
+        await q.answer()
+        behind = (self._upd or {}).get("behind") or 0
+        L = ["⬇️ <b>要更新到最新吗</b>", ""]
+        if behind:
+            L.append("会把代码拉到远端最新（%d 个新提交），然后重启一下。" % behind)
+        else:
+            L.append("会把代码拉到远端最新，然后重启一下。")
+        L += ["", "重启期间大约十几秒不回话；这期间收到的消息 Telegram 会留着，起来之后照常处理。",
+              "代码目录里要是有没提交的改动，它会停下来告诉你，不会覆盖。"]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ 确认更新并重启", callback_data="R:y")],
+            [InlineKeyboardButton("算了", callback_data="R:")]])
+        await self._show(q, "\n".join(L), kb)
+
+    async def cb_update_do(self, update, context):
+        q = update.callback_query
+        await q.answer("正在拉代码…")
+        chat = q.message.chat_id
+        res = await asyncio.to_thread(tg_update.pull)
+        if not res.get("ok"):
+            await self._show(q, "❌ 没更新成。\n\n%s\n\n要手动来的话：<code>cd %s && git pull</code>"
+                             % (_html.escape(str(res.get("error") or "")[:400]),
+                                _html.escape(tg_update.HERE)), self.kb_version())
+            return
+        self._last_update = {"from": res.get("from"), "to": res.get("to"), "at": time.time(),
+                             "when": _short_now(), "note": "更新到 %s" % res.get("to")}
+        try:
+            await asyncio.to_thread(save_json, os.path.join(self.s.out, "update.json"),
+                                    self._last_update)
+        except Exception as e:
+            log("[!] 记更新状态失败: %s" % str(e)[:100])
+        self._upd = {"ok": True, "behind": 0, "commits": [], "branch": res.get("branch")}
+        body = ["⬇️ 代码已经更新到 <code>%s</code>。" % _html.escape(str(res.get("to") or ""))]
+        if res.get("log"):
+            body += ["", "这次拉到的："] + ["· %s" % _html.escape(x) for x in res["log"][:6]]
+        if any("requirements" in f for f in (res.get("files") or [])):
+            body += ["", "⚠️ 依赖清单也变了，重启后如果起不来，先跑一次 "
+                         "<code>pip install -r requirements.txt</code>。"]
+        body += ["", "这就重启一下，十几秒后我回来。"]
+        await self._send(chat, "\n".join(body))
+        self.s.request_restart("更新到 %s" % (res.get("to") or ""))
+
+    async def cb_restart(self, update, context):
+        q = update.callback_query
+        await q.answer("这就重启")
+        await self._send(q.message.chat_id, "♻️ 正在重启，十几秒后回来。")
+        self.s.request_restart("手动重启")
+
+    async def cb_rollback(self, update, context):
+        q = update.callback_query
+        await q.answer("正在回滚…")
+        last = self._last_update or {}
+        res = await asyncio.to_thread(tg_update.rollback, str(last.get("from") or ""))
+        if not res.get("ok"):
+            await self._show(q, "❌ 没回滚成。\n\n%s" % _html.escape(str(res.get("error") or "")[:400]),
+                             self.kb_version())
+            return
+        self._last_update = {"from": res.get("to"), "to": res.get("from"), "at": time.time(),
+                             "when": _short_now(), "note": "回滚到 %s" % res.get("to")}
+        try:
+            await asyncio.to_thread(save_json, os.path.join(self.s.out, "update.json"),
+                                    self._last_update)
+        except Exception as e:
+            log("[!] 记回滚状态失败: %s" % str(e)[:100])
+        await self._send(q.message.chat_id,
+                         "↩️ 已回到 <code>%s</code>，重启一下。" % _html.escape(str(res.get("to") or "")))
+        self.s.request_restart("回滚到 %s" % (res.get("to") or ""))
 
     async def cb_login(self, update, context):
         q = update.callback_query
@@ -1631,6 +1759,12 @@ class TgBot(threading.Thread):
              "凭证：%s" % auth,
              "夜间静默：%s" % quiet,
              "本次运行记录到 %d 次变动" % events]
+        cur = tg_update.current() or {}
+        if cur.get("hash"):
+            L.append("版本：<code>%s</code> · %s%s" % (
+                _html.escape(cur["hash"]), _html.escape(cur.get("when") or ""),
+                (" · 远端有 %d 个新提交" % self._upd["behind"])
+                if (self._upd or {}).get("behind") else ""))
         if not s.gnames:
             L.append("星球名单：还没拉到（凭证多半失效了，发 /login）")
         auto = [_html.escape(s.gnames.get(g, g)) for g, on in self.autopush.items() if on]
@@ -1647,6 +1781,54 @@ class TgBot(threading.Thread):
                 _html.escape(gname), s.describe(g, with_name=False),
                 ("上次检查 " + _ago(last)) if last else "还没检查过"))
         return "\n".join(L)
+
+    def version_text(self):
+        """版本与更新页。不联网 —— 只有点了「检查更新」才会去问远端。"""
+        L = ["🔄 <b>版本与更新</b>", ""]
+        if not tg_update.is_repo():
+            L += ["程序目录不是 git 仓库，自动更新用不了。",
+                  "（多半是直接把文件拷过来的；想一键更新，就用 git clone 拿一份。）",
+                  "", "程序目录：<code>%s</code>" % _html.escape(tg_update.HERE)]
+            return "\n".join(L)
+        cur = tg_update.current() or {}
+        L.append("现在跑的是 <code>%s</code> · %s"
+                 % (_html.escape(cur.get("hash") or "?"), _html.escape(cur.get("when") or "")))
+        if cur.get("subject"):
+            L.append("「%s」" % _html.escape(cur["subject"]))
+        L.append("分支：%s" % _html.escape(cur.get("branch") or "?"))
+        upd = self._upd
+        if upd is None:
+            L += ["", "还没问过远端。点「检查更新」去问一下 —— 只读，不会动代码。"]
+        elif not upd.get("ok"):
+            L += ["", "上次检查没成功：%s" % _html.escape(upd.get("error") or "原因不明")]
+        elif not upd.get("behind"):
+            L += ["", "已经是最新的了（远端没有新提交）。"]
+        else:
+            L += ["", "远端有 <b>%d</b> 个新提交：" % upd["behind"]]
+            for h, subj in upd["commits"][:8]:
+                L.append("· <code>%s</code> %s" % (_html.escape(h), _html.escape(subj)))
+            if upd["behind"] > 8:
+                L.append("· …还有 %d 个" % (upd["behind"] - 8))
+        last = self._last_update or {}
+        if last.get("from"):
+            L += ["", "上一次更新：<code>%s</code> → <code>%s</code>（%s）"
+                  % (_html.escape(str(last.get("from"))), _html.escape(str(last.get("to"))),
+                     _html.escape(str(last.get("when") or "")))]
+        L += ["", "更新会先把代码拉到远端最新，再换个进程重启；期间机器人有一小会儿不回话。"
+                  "代码目录里要是有没提交的改动，它会停下来告诉你，不会覆盖。"]
+        return "\n".join(L)
+
+    def kb_version(self):
+        rows = [[InlineKeyboardButton("🔍 检查更新", callback_data="R:c")]]
+        if self._upd and self._upd.get("behind"):
+            rows.append([InlineKeyboardButton("⬇️ 更新并重启", callback_data="R:u")])
+        rows.append([InlineKeyboardButton("♻️ 只重启", callback_data="R:r")])
+        last = self._last_update or {}
+        if last.get("from") and last.get("from") != last.get("to"):
+            rows.append([InlineKeyboardButton("↩️ 回到 %s" % str(last["from"]),
+                                              callback_data="R:b")])
+        rows.append([InlineKeyboardButton("◀ 主菜单", callback_data="menu")])
+        return InlineKeyboardMarkup(rows)
 
     # ---- 动作 ----
 

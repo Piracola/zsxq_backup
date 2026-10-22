@@ -160,6 +160,7 @@ class Sentinel:
         self._auth_dirty = False  # 有请求失败 → 下一轮强制重验凭证, 不吃缓存
         self._last_prune = 0.0    # 限量清理不必每轮都做
         self._index_dirty = False  # 删除/编辑发生过, 轮末要重建 index.md
+        self._restart = None      # 不为 None 就表示「这一轮跑完重启自己」
         self.bot = None           # Telegram 机器人线程 (main 里启动)
 
     # ---------- 基础 ----------
@@ -845,6 +846,8 @@ class Sentinel:
             log("[!] 还没有配置星球 —— 机器人照常在线, 用 /groups 挑一个开自动推送即可")
         next_run = {}
         while True:
+            if self._restart:                       # 机器人点了更新/重启, 这一轮跑完就换
+                self.hand_over()
             groups = [str(g) for g in self.cfg["groups"] if g]   # 机器人可能刚加了星球
             for g in groups:
                 next_run.setdefault(g, 0.0)
@@ -861,6 +864,42 @@ class Sentinel:
                     log("[!] 轮询异常 (%s): %r" % (g, e))
                     base = 60                    # 出异常就多歇一会再试
                 next_run[g] = time.time() + base * random.uniform(0.75, 1.25)
+
+    def request_restart(self, note="重启"):
+        """机器人点了「更新并重启」: 记下来, 这一轮跑完自己把自己换掉。
+        不在按钮回调里直接 exec —— 那时可能正有人在写 state。"""
+        self._restart = {"note": note, "at": time.time()}
+
+    def hand_over(self):
+        """把控制权交出去: 停 polling、落盘、留个记号、换成新代码重启自己。
+        换成新代码而不是退出, 是为了不依赖 systemd / nohup 之类的守护:
+        没守护的时候退出就再也起不来了。"""
+        note = (self._restart or {}).get("note") or "重启"
+        self._restart = None
+        log("[·] 准备重启: %s" % note)
+        try:
+            if self.bot:
+                self.bot.shutdown_quietly()      # 先停下 getUpdates, 免得重启后撞 409
+        except Exception as e:
+            log("[!] 停机器人失败 (照样重启): %s" % str(e)[:100])
+        try:
+            self.save_state()
+        except Exception as e:
+            log("[!] 落盘失败 (照样重启): %s" % str(e)[:100])
+        try:
+            import tg_update
+            v = tg_update.current()
+            save_json(os.path.join(self.out, "restart.json"),
+                      {"note": note, "at": time.time(),
+                       "version": v.get("hash") or "", "when": v.get("when") or ""})
+        except Exception as e:
+            log("[!] 写重启记号失败: %s" % str(e)[:100])
+        argv = [sys.executable] + sys.argv
+        log("[·] 用新代码重启: %s" % " ".join(argv))
+        try:
+            os.execv(sys.executable, argv)
+        except Exception as e:
+            log("[!] 自动重启失败 (%s) —— 请手动重启一下服务, 新代码已经落盘了" % str(e)[:120])
 
     def describe(self, gid, with_name=True):
         """把某个星球的实际节奏写成一行, 启动日志 / /status / 星球页都用它。"""
